@@ -1,0 +1,12 @@
+{
+  "servers": [
+    {
+      "address": "127.0.0.1:8080",
+      "endpoints": ["/", "/about"]
+    },
+    {
+      "address": "127.0.0.1:8081",
+      "endpoints": ["/contact"]
+    }
+  ]
+}
