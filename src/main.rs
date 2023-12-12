@@ -1,5 +1,5 @@
 use colored::*;
-use nix::sys::epoll::{Epoll, EpollCreateFlags, EpollEvent, EpollFlags};
+use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLL_CTL_ADD, EPOLLIN};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -32,7 +32,7 @@ fn handle_client(mut stream: TcpStream, _config: &ServerConfig) -> std::io::Resu
         return Ok(()); // Example handling
     }
     println!(
-        "Request: {}",
+        "Request: \n{}",
         str::from_utf8(&buffer[..bytes_read]).unwrap()
     );
 
@@ -45,21 +45,30 @@ fn handle_client(mut stream: TcpStream, _config: &ServerConfig) -> std::io::Resu
 
 fn main() -> std::io::Result<()> {
     let config = load_config("config/config.json").expect("Failed to load config");
-    let epoll_fd = Epoll::new(EpollCreateFlags::EPOLL_CLOEXEC).unwrap();
-    let mut listeners = HashMap::new();
-    let mut _events: Vec<EpollEvent> = Vec::new();
 
-    // Set up listeners for each server configuration
+    let epoll_fd = unsafe { epoll_create1(0) };
+    if epoll_fd == -1 {
+        panic!("Failed to create epoll instance");
+    }
+
+    let mut listeners = HashMap::new();
+
     for server_config in &config.servers {
         let listener = TcpListener::bind(&server_config.address)?;
         listener.set_nonblocking(true)?;
         let fd = listener.as_raw_fd();
 
-        let event = EpollEvent::new(EpollFlags::EPOLLIN, fd as u64);
-        epoll_fd.add(&listener, event).unwrap();
+        let mut event = epoll_event {
+            events: EPOLLIN as u32,
+            u64: fd as u64,
+        };
+
+        unsafe {
+            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &mut event);
+        }
+
         listeners.insert(fd, (listener, server_config));
 
-        // Print statement with ANSI coloration
         println!(
             "Server up and running on {}: {}",
             server_config.address.blue(),
@@ -68,16 +77,23 @@ fn main() -> std::io::Result<()> {
     }
 
     loop {
-        let mut events_buffer = [EpollEvent::empty(); 10];
-        let num_events = epoll_fd.wait(&mut events_buffer, -1).unwrap();
+        let mut events = [epoll_event { events: 0, u64: 0 }; 10];
+        let num_events = unsafe { epoll_wait(epoll_fd, events.as_mut_ptr(), 10, -1) };
 
-        for event in &events_buffer[..num_events] {
-            let fd = event.data() as RawFd;
+        if num_events == -1 {
+            eprintln!("Error in epoll wait");
+            continue;
+        }
+
+        for i in 0..num_events as usize {
+            let fd = events[i].u64 as RawFd;
             if let Some((listener, config)) = listeners.get(&fd) {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         if let Err(e) = handle_client(stream, config) {
                             eprintln!("Failed to handle client: {}", e);
+                        } else {
+                            println!("Handled client");
                         }
                     }
                     Err(e) => eprintln!("Failed to accept connection: {}", e),

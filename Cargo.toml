@@ -8,5 +8,6 @@ edition = "2021"
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0.108"
-nix = { version = "0.27.1", features = ["event"] }
 colored = "2.0.4"
+config = { version = "0.13.4", features = [] }
+libc = { version = "0.2.150", features = [] }
