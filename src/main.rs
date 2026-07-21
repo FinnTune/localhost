@@ -94,8 +94,8 @@ fn main() -> std::io::Result<()> {
             continue;
         }
 
-        for i in 0..num_events as usize {
-            let fd = events[i].u64 as RawFd;
+        for event in events.iter().take(num_events as usize) {
+            let fd = event.u64 as RawFd;
             if let Some((listener, config)) = listeners.get(&fd) {
                 match listener.accept() {
                     Ok((stream, _)) => {
