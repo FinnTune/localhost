@@ -1,28 +1,16 @@
-use colored::*;
-use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLL_CTL_ADD, EPOLLIN};
-use serde::{Deserialize, Serialize};
+mod config;
+mod json;
+mod log;
+
+use config::{load_config, ServerConfig};
+use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLL_CTL_ADD};
+use log::{blue, green};
 use std::collections::HashMap;
-use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::str;
 
-#[derive(Serialize, Deserialize, Debug)]
-struct ServerConfig {
-    address: String,
-    endpoints: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-struct Config {
-    servers: Vec<ServerConfig>,
-}
-
-fn load_config(file_path: &str) -> serde_json::Result<Config> {
-    let config_str = fs::read_to_string(file_path).expect("Failed to read configuration file.");
-    serde_json::from_str(&config_str)
-}
 fn handle_client(mut stream: TcpStream, _config: &ServerConfig) -> std::io::Result<()> {
     let mut buffer = [0; 1024];
     let bytes_read = stream.read(&mut buffer)?;
@@ -71,8 +59,8 @@ fn main() -> std::io::Result<()> {
 
         println!(
             "Server up and running on {}: {}",
-            server_config.address.blue(),
-            "✓".green()
+            blue(&server_config.address),
+            green("✓")
         );
     }
 
