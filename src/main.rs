@@ -1,31 +1,52 @@
 mod config;
+mod http;
 mod json;
 mod log;
 
 use config::{load_config, ServerConfig};
+use http::{ParseOutcome, Request, Response};
 use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLL_CTL_ADD};
 use log::{blue, green};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::str;
+
+fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        match http::request::parse(&buffer) {
+            ParseOutcome::Complete { request, .. } => return Ok(Some(request)),
+            ParseOutcome::Invalid { status, message } => {
+                let response = Response::error(status, &message);
+                stream.write_all(&response.to_bytes())?;
+                stream.flush()?;
+                return Ok(None);
+            }
+            ParseOutcome::Incomplete => {
+                let bytes_read = stream.read(&mut chunk)?;
+                if bytes_read == 0 {
+                    // Client closed the connection before sending a complete request.
+                    return Ok(None);
+                }
+                buffer.extend_from_slice(&chunk[..bytes_read]);
+            }
+        }
+    }
+}
 
 fn handle_client(mut stream: TcpStream, _config: &ServerConfig) -> std::io::Result<()> {
-    let mut buffer = [0; 1024];
-    let bytes_read = stream.read(&mut buffer)?;
-    if bytes_read == 0 {
-        // Handle the case where the connection was closed or no data was read
-        // This could be returning an error or simply exiting the function
-        return Ok(()); // Example handling
-    }
-    println!(
-        "Request: \n{}",
-        str::from_utf8(&buffer[..bytes_read]).unwrap()
-    );
+    let request = match read_request(&mut stream)? {
+        Some(request) => request,
+        None => return Ok(()),
+    };
 
-    let response = "HTTP/1.1 200 OK\r\n\r\n";
-    stream.write_all(response.as_bytes())?;
+    println!("Request: {} {}", request.method.as_str(), request.path);
+
+    let response = Response::ok_empty();
+    stream.write_all(&response.to_bytes())?;
     stream.flush()?;
 
     Ok(())
