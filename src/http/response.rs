@@ -25,10 +25,6 @@ impl Response {
         self
     }
 
-    pub fn ok_empty() -> Self {
-        Response::new(200, "OK")
-    }
-
     pub fn error(status: u16, message: &str) -> Self {
         Response::new(status, reason_phrase(status))
             .header("Content-Type", "text/plain")
@@ -57,6 +53,8 @@ fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
         413 => "Payload Too Large",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
@@ -70,7 +68,7 @@ mod tests {
 
     #[test]
     fn renders_status_line_and_auto_content_length() {
-        let response = Response::ok_empty();
+        let response = Response::new(200, "OK");
         let bytes = response.to_bytes();
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));

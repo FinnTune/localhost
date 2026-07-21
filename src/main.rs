@@ -2,6 +2,8 @@ mod config;
 mod http;
 mod json;
 mod log;
+mod router;
+mod static_files;
 
 use config::{load_config, ServerConfig};
 use http::{ParseOutcome, Request, Response};
@@ -37,7 +39,7 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
     }
 }
 
-fn handle_client(mut stream: TcpStream, _config: &ServerConfig) -> std::io::Result<()> {
+fn handle_client(mut stream: TcpStream, config: &ServerConfig) -> std::io::Result<()> {
     let request = match read_request(&mut stream)? {
         Some(request) => request,
         None => return Ok(()),
@@ -45,7 +47,11 @@ fn handle_client(mut stream: TcpStream, _config: &ServerConfig) -> std::io::Resu
 
     println!("Request: {} {}", request.method.as_str(), request.path);
 
-    let response = Response::ok_empty();
+    let response = match router::match_location(config, &request.path) {
+        Some(location) => static_files::serve(location, &request.path),
+        None => Response::error(404, "No location configured for this path"),
+    };
+
     stream.write_all(&response.to_bytes())?;
     stream.flush()?;
 

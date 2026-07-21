@@ -2,11 +2,16 @@
   "servers": [
     {
       "address": "127.0.0.1:8080",
-      "endpoints": ["/", "/about"]
+      "locations": [
+        { "path": "/", "root": "www/site1", "index": "index.html", "methods": ["GET"], "autoindex": false },
+        { "path": "/about", "root": "www/site1", "index": "about.html", "methods": ["GET"], "autoindex": false }
+      ]
     },
     {
       "address": "127.0.0.1:8081",
-      "endpoints": ["/contact"]
+      "locations": [
+        { "path": "/contact", "root": "www/site2", "index": "contact.html", "methods": ["GET"], "autoindex": false }
+      ]
     }
   ]
 }
