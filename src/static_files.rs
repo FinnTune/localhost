@@ -1,18 +1,16 @@
 use crate::config::Location;
+use crate::fs_safety;
 use crate::http::Response;
 use std::fs;
 use std::path::Path;
 
 pub fn serve(location: &Location, request_path: &str) -> Response {
-    let canonical_root = match fs::canonicalize(&location.root) {
+    let canonical_root = match fs_safety::canonical_root(&location.root) {
         Ok(root) => root,
-        Err(_) => return Response::error(500, "Server misconfigured: location root not found"),
+        Err(response) => return response,
     };
 
-    let relative = request_path
-        .strip_prefix(&location.path)
-        .unwrap_or(request_path)
-        .trim_start_matches('/');
+    let relative = fs_safety::relative_path(&location.path, request_path);
 
     let joined = if relative.is_empty() {
         canonical_root.clone()
@@ -25,7 +23,7 @@ pub fn serve(location: &Location, request_path: &str) -> Response {
         Err(_) => return Response::error(404, "Not Found"),
     };
 
-    if !target.starts_with(&canonical_root) {
+    if !fs_safety::within_root(&target, &canonical_root) {
         return Response::error(403, "Forbidden");
     }
 
@@ -36,7 +34,7 @@ pub fn serve(location: &Location, request_path: &str) -> Response {
             // no configured index is simply not servable.
             None => return Response::error(403, "Forbidden"),
         };
-        if !target.starts_with(&canonical_root) || !target.is_file() {
+        if !fs_safety::within_root(&target, &canonical_root) || !target.is_file() {
             return Response::error(404, "Not Found");
         }
     }

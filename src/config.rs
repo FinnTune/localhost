@@ -6,8 +6,6 @@ pub struct Location {
     pub path: String,
     pub root: String,
     pub index: Option<String>,
-    // Not read yet: method enforcement lands in the Phase 4 commit.
-    #[allow(dead_code)]
     pub methods: Vec<String>,
     // Not read yet: directory listing lands in the Phase 8 commit.
     #[allow(dead_code)]

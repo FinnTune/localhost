@@ -1,12 +1,14 @@
 mod config;
+mod file_ops;
+mod fs_safety;
 mod http;
 mod json;
 mod log;
 mod router;
 mod static_files;
 
-use config::{load_config, ServerConfig};
-use http::{ParseOutcome, Request, Response};
+use config::{load_config, Location, ServerConfig};
+use http::{Method, ParseOutcome, Request, Response};
 use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLL_CTL_ADD};
 use log::{blue, green};
 use std::collections::HashMap;
@@ -39,6 +41,24 @@ fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
     }
 }
 
+fn dispatch(location: &Location, request: &Request) -> Response {
+    if !location
+        .methods
+        .iter()
+        .any(|allowed| allowed == request.method.as_str())
+    {
+        return Response::error(405, "Method Not Allowed")
+            .header("Allow", &location.methods.join(", "));
+    }
+
+    match request.method {
+        Method::Get => static_files::serve(location, &request.path),
+        Method::Post => file_ops::create(location, &request.path, &request.body),
+        Method::Delete => file_ops::delete(location, &request.path),
+        _ => Response::error(501, "Not Implemented"),
+    }
+}
+
 fn handle_client(mut stream: TcpStream, config: &ServerConfig) -> std::io::Result<()> {
     let request = match read_request(&mut stream)? {
         Some(request) => request,
@@ -48,7 +68,7 @@ fn handle_client(mut stream: TcpStream, config: &ServerConfig) -> std::io::Resul
     println!("Request: {} {}", request.method.as_str(), request.path);
 
     let response = match router::match_location(config, &request.path) {
-        Some(location) => static_files::serve(location, &request.path),
+        Some(location) => dispatch(location, &request),
         None => Response::error(404, "No location configured for this path"),
     };
 
