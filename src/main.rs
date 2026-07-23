@@ -15,28 +15,46 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::time::Duration;
 
-fn read_request(stream: &mut TcpStream) -> std::io::Result<Option<Request>> {
-    let mut buffer = Vec::new();
+const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Parses the next request off `buffer` (which may already hold pipelined
+/// bytes left over from a previous request on this connection), reading
+/// more from the socket as needed. Returns the request plus whatever bytes
+/// after it haven't been consumed yet, so the caller can feed them straight
+/// back in for the next request on a persistent connection.
+fn read_request(
+    stream: &mut TcpStream,
+    mut buffer: Vec<u8>,
+) -> std::io::Result<Option<(Request, Vec<u8>)>> {
     let mut chunk = [0u8; 4096];
 
     loop {
         match http::request::parse(&buffer) {
-            ParseOutcome::Complete { request, .. } => return Ok(Some(request)),
+            ParseOutcome::Complete { request, consumed } => {
+                let remaining = buffer[consumed..].to_vec();
+                return Ok(Some((request, remaining)));
+            }
             ParseOutcome::Invalid { status, message } => {
                 let response = Response::error(status, &message);
                 stream.write_all(&response.to_bytes())?;
                 stream.flush()?;
                 return Ok(None);
             }
-            ParseOutcome::Incomplete => {
-                let bytes_read = stream.read(&mut chunk)?;
-                if bytes_read == 0 {
-                    // Client closed the connection before sending a complete request.
-                    return Ok(None);
+            ParseOutcome::Incomplete => match stream.read(&mut chunk) {
+                Ok(0) => return Ok(None), // client closed before a complete request arrived
+                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None); // idle too long; drop the connection
                 }
-                buffer.extend_from_slice(&chunk[..bytes_read]);
-            }
+                Err(e) => return Err(e),
+            },
         }
     }
 }
@@ -60,22 +78,31 @@ fn dispatch(location: &Location, request: &Request) -> Response {
 }
 
 fn handle_client(mut stream: TcpStream, config: &ServerConfig) -> std::io::Result<()> {
-    let request = match read_request(&mut stream)? {
-        Some(request) => request,
-        None => return Ok(()),
-    };
+    stream.set_read_timeout(Some(IDLE_READ_TIMEOUT))?;
+    let mut leftover = Vec::new();
 
-    println!("Request: {} {}", request.method.as_str(), request.path);
+    loop {
+        let (request, remaining) = match read_request(&mut stream, leftover)? {
+            Some(pair) => pair,
+            None => return Ok(()),
+        };
+        leftover = remaining;
 
-    let response = match router::match_location(config, &request.path) {
-        Some(location) => dispatch(location, &request),
-        None => Response::error(404, "No location configured for this path"),
-    };
+        println!("Request: {} {}", request.method.as_str(), request.path);
 
-    stream.write_all(&response.to_bytes())?;
-    stream.flush()?;
+        let response = match router::match_location(config, &request.path) {
+            Some(location) => dispatch(location, &request),
+            None => Response::error(404, "No location configured for this path"),
+        };
 
-    Ok(())
+        let keep_alive = request.keep_alive();
+        stream.write_all(&response.to_bytes())?;
+        stream.flush()?;
+
+        if !keep_alive {
+            return Ok(());
+        }
+    }
 }
 
 fn main() -> std::io::Result<()> {

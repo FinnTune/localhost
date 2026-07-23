@@ -14,13 +14,26 @@ Implemented so far:
 - Non-blocking TCP listeners multiplexed on one `epoll` instance
 - A hand-rolled JSON parser/value type for reading `config/config.json`
 - An incremental HTTP/1.1 request parser (tolerates partial reads,
-  `Content-Length` bodies) and a response builder
+  `Content-Length` and chunked bodies) and a response builder
 - Location-based routing (longest-prefix match, nginx-style) and static file
   serving, with path canonicalization to block directory traversal
+- GET/POST/DELETE with per-location method enforcement (`405` + `Allow`),
+  POST writing uploaded bodies to disk, DELETE removing files
+- Persistent (keep-alive) connections honoring `Connection: close` and the
+  HTTP/1.0-vs-1.1 default, plus an idle-read timeout so an abandoned
+  connection doesn't hang around forever
 
-Not yet implemented: method enforcement (POST/DELETE), keep-alive and
-chunked transfer encoding, name-based virtual hosts, CGI, uploads, directory
-listing (`autoindex`), and load/stress-test hardening.
+Not yet implemented: name-based virtual hosts, CGI, multipart uploads,
+directory listing (`autoindex`), and load/stress-test hardening.
+
+**Known limitation:** connection handling is still fully synchronous —
+only the *listening* sockets are multiplexed via `epoll`; an accepted
+client is handled to completion (including waiting out the keep-alive idle
+timeout) before the server returns to `accept()` on others. A slow or idle
+client can currently starve other clients for up to that timeout. Fixing
+this means registering client sockets in `epoll` too and turning connection
+handling into a proper per-connection state machine — planned as part of
+the Phase 9 hardening pass rather than bolted on ad hoc.
 
 ## Running
 
