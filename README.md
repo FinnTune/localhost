@@ -22,9 +22,12 @@ Implemented so far:
 - Persistent (keep-alive) connections honoring `Connection: close` and the
   HTTP/1.0-vs-1.1 default, plus an idle-read timeout so an abandoned
   connection doesn't hang around forever
+- Name-based virtual hosts: several server blocks can share one listening
+  port, disambiguated by the `Host` header, with the first block for that
+  address acting as the default when there's no match
 
-Not yet implemented: name-based virtual hosts, CGI, multipart uploads,
-directory listing (`autoindex`), and load/stress-test hardening.
+Not yet implemented: CGI, multipart uploads, directory listing
+(`autoindex`), and load/stress-test hardening.
 
 **Known limitation:** connection handling is still fully synchronous —
 only the *listening* sockets are multiplexed via `epoll`; an accepted
@@ -42,32 +45,37 @@ cargo run
 ```
 
 The bundled `config/config.json` starts two servers demonstrating routing
-across two ports:
+across two ports, plus a second name-based virtual host sharing port 8080:
 
 ```sh
 curl http://127.0.0.1:8080/
 curl http://127.0.0.1:8080/about
 curl http://127.0.0.1:8081/contact
+curl http://127.0.0.1:8080/ -H "Host: beta.localhost"
 ```
 
 ## Configuration
 
-`config/config.json` defines one or more `servers`, each with an `address`
-and a list of `locations`:
+`config/config.json` defines one or more `servers`, each with an `address`,
+an optional `server_name`, and a list of `locations`:
 
 ```json
 {
-  "path": "/about",
-  "root": "www/site1",
-  "index": "about.html",
-  "methods": ["GET"],
-  "autoindex": false
+  "address": "127.0.0.1:8080",
+  "server_name": "beta.localhost",
+  "locations": [
+    { "path": "/about", "root": "www/site1", "index": "about.html", "methods": ["GET"], "autoindex": false }
+  ]
 }
 ```
 
-Requests are matched to the most specific (longest-prefix) location whose
-`path` prefixes the request path, then served as a static file rooted at
-`root` (falling back to `index` for directory requests).
+Several server blocks can share one `address`; the `Host` header (port
+suffix stripped) picks between them by matching `server_name`, falling
+back to the first block declared for that address if there's no header or
+no match. Within a chosen server, requests are matched to the most
+specific (longest-prefix) location whose `path` prefixes the request path,
+then served as a static file rooted at `root` (falling back to `index` for
+directory requests).
 
 ## Testing
 

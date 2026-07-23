@@ -15,6 +15,7 @@ pub struct Location {
 #[derive(Debug)]
 pub struct ServerConfig {
     pub address: String,
+    pub server_name: Option<String>,
     pub locations: Vec<Location>,
 }
 
@@ -82,6 +83,15 @@ fn server_config_from_json(value: &JsonValue) -> Result<ServerConfig, String> {
         .ok_or("server entry missing string field 'address'")?
         .to_string();
 
+    let server_name = match value.get("server_name") {
+        Some(v) => Some(
+            v.as_str()
+                .ok_or("server field 'server_name' must be a string")?
+                .to_string(),
+        ),
+        None => None,
+    };
+
     let locations = value
         .get("locations")
         .and_then(JsonValue::as_array)
@@ -90,7 +100,11 @@ fn server_config_from_json(value: &JsonValue) -> Result<ServerConfig, String> {
         .map(location_from_json)
         .collect::<Result<Vec<Location>, String>>()?;
 
-    Ok(ServerConfig { address, locations })
+    Ok(ServerConfig {
+        address,
+        server_name,
+        locations,
+    })
 }
 
 fn config_from_json(value: &JsonValue) -> Result<Config, String> {

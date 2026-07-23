@@ -77,7 +77,7 @@ fn dispatch(location: &Location, request: &Request) -> Response {
     }
 }
 
-fn handle_client(mut stream: TcpStream, config: &ServerConfig) -> std::io::Result<()> {
+fn handle_client(mut stream: TcpStream, configs: &[&ServerConfig]) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IDLE_READ_TIMEOUT))?;
     let mut leftover = Vec::new();
 
@@ -90,7 +90,8 @@ fn handle_client(mut stream: TcpStream, config: &ServerConfig) -> std::io::Resul
 
         println!("Request: {} {}", request.method.as_str(), request.path);
 
-        let response = match router::match_location(config, &request.path) {
+        let server = router::select_server(configs, request.header("host"));
+        let response = match router::match_location(server, &request.path) {
             Some(location) => dispatch(location, &request),
             None => Response::error(404, "No location configured for this path"),
         };
@@ -113,10 +114,21 @@ fn main() -> std::io::Result<()> {
         panic!("Failed to create epoll instance");
     }
 
+    // Group server blocks by listening address: several blocks can share one
+    // port and are disambiguated later by Host header (name-based virtual
+    // hosting), so we bind each unique address only once.
+    let mut groups: HashMap<&str, Vec<&ServerConfig>> = HashMap::new();
+    for server_config in &config.servers {
+        groups
+            .entry(server_config.address.as_str())
+            .or_default()
+            .push(server_config);
+    }
+
     let mut listeners = HashMap::new();
 
-    for server_config in &config.servers {
-        let listener = TcpListener::bind(&server_config.address)?;
+    for (address, server_configs) in groups {
+        let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let fd = listener.as_raw_fd();
 
@@ -129,12 +141,18 @@ fn main() -> std::io::Result<()> {
             epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &mut event);
         }
 
-        listeners.insert(fd, (listener, server_config));
+        let names: Vec<&str> = server_configs
+            .iter()
+            .map(|c| c.server_name.as_deref().unwrap_or("default"))
+            .collect();
+
+        listeners.insert(fd, (listener, server_configs));
 
         println!(
-            "Server up and running on {}: {}",
-            blue(&server_config.address),
-            green("✓")
+            "Server up and running on {}: {} ({})",
+            blue(address),
+            green("✓"),
+            names.join(", ")
         );
     }
 
@@ -149,10 +167,10 @@ fn main() -> std::io::Result<()> {
 
         for event in events.iter().take(num_events as usize) {
             let fd = event.u64 as RawFd;
-            if let Some((listener, config)) = listeners.get(&fd) {
+            if let Some((listener, configs)) = listeners.get(&fd) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        if let Err(e) = handle_client(stream, config) {
+                        if let Err(e) = handle_client(stream, configs) {
                             eprintln!("Failed to handle client: {}", e);
                         } else {
                             println!("Handled client");

@@ -9,6 +9,13 @@
       ]
     },
     {
+      "address": "127.0.0.1:8080",
+      "server_name": "beta.localhost",
+      "locations": [
+        { "path": "/", "root": "www/site3", "index": "index.html", "methods": ["GET"], "autoindex": false }
+      ]
+    },
+    {
       "address": "127.0.0.1:8081",
       "locations": [
         { "path": "/contact", "root": "www/site2", "index": "contact.html", "methods": ["GET"], "autoindex": false }
