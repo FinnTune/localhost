@@ -65,6 +65,7 @@ mod tests {
                     index: None,
                     methods: vec!["GET".to_string()],
                     autoindex: false,
+                    cgi: std::collections::HashMap::new(),
                 })
                 .collect(),
         }

@@ -1,4 +1,5 @@
 use crate::json::{self, JsonValue};
+use std::collections::HashMap;
 use std::fs;
 
 #[derive(Debug)]
@@ -10,6 +11,9 @@ pub struct Location {
     // Not read yet: directory listing lands in the Phase 8 commit.
     #[allow(dead_code)]
     pub autoindex: bool,
+    /// Maps a file extension (no leading dot, e.g. "sh") to the interpreter
+    /// binary that should execute matching scripts as CGI.
+    pub cgi: HashMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -67,12 +71,27 @@ fn location_from_json(value: &JsonValue) -> Result<Location, String> {
         None => false,
     };
 
+    let cgi = match value.get("cgi") {
+        Some(JsonValue::Object(map)) => map
+            .iter()
+            .map(|(extension, interpreter)| {
+                interpreter
+                    .as_str()
+                    .map(|path| (extension.clone(), path.to_string()))
+                    .ok_or_else(|| "cgi interpreter paths must be strings".to_string())
+            })
+            .collect::<Result<HashMap<String, String>, String>>()?,
+        Some(_) => return Err("location field 'cgi' must be an object".to_string()),
+        None => HashMap::new(),
+    };
+
     Ok(Location {
         path,
         root,
         index,
         methods,
         autoindex,
+        cgi,
     })
 }
 

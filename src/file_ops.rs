@@ -94,6 +94,7 @@ mod tests {
             index: None,
             methods: vec!["GET".to_string(), "POST".to_string(), "DELETE".to_string()],
             autoindex: false,
+            cgi: std::collections::HashMap::new(),
         }
     }
 

@@ -1,3 +1,4 @@
+mod cgi;
 mod config;
 mod file_ops;
 mod fs_safety;
@@ -7,13 +8,14 @@ mod log;
 mod router;
 mod static_files;
 
+use cgi::CgiContext;
 use config::{load_config, Location, ServerConfig};
 use http::{Method, ParseOutcome, Request, Response};
 use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLL_CTL_ADD};
 use log::{blue, green};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
@@ -59,7 +61,7 @@ fn read_request(
     }
 }
 
-fn dispatch(location: &Location, request: &Request) -> Response {
+fn dispatch(location: &Location, request: &Request, ctx: &CgiContext) -> Response {
     if !location
         .methods
         .iter()
@@ -67,6 +69,10 @@ fn dispatch(location: &Location, request: &Request) -> Response {
     {
         return Response::error(405, "Method Not Allowed")
             .header("Allow", &location.methods.join(", "));
+    }
+
+    if let Some(interpreter) = cgi::interpreter_for(location, &request.path) {
+        return cgi::execute(location, &interpreter, request, &request.path, ctx);
     }
 
     match request.method {
@@ -77,9 +83,14 @@ fn dispatch(location: &Location, request: &Request) -> Response {
     }
 }
 
-fn handle_client(mut stream: TcpStream, configs: &[&ServerConfig]) -> std::io::Result<()> {
+fn handle_client(
+    mut stream: TcpStream,
+    configs: &[&ServerConfig],
+    peer_addr: SocketAddr,
+) -> std::io::Result<()> {
     stream.set_read_timeout(Some(IDLE_READ_TIMEOUT))?;
     let mut leftover = Vec::new();
+    let remote_addr = peer_addr.ip().to_string();
 
     loop {
         let (request, remaining) = match read_request(&mut stream, leftover)? {
@@ -91,8 +102,18 @@ fn handle_client(mut stream: TcpStream, configs: &[&ServerConfig]) -> std::io::R
         println!("Request: {} {}", request.method.as_str(), request.path);
 
         let server = router::select_server(configs, request.header("host"));
+        let (server_host, server_port) = server
+            .address
+            .rsplit_once(':')
+            .unwrap_or((server.address.as_str(), ""));
+        let ctx = CgiContext {
+            server_name: server.server_name.as_deref().unwrap_or(server_host),
+            server_port,
+            remote_addr: &remote_addr,
+        };
+
         let response = match router::match_location(server, &request.path) {
-            Some(location) => dispatch(location, &request),
+            Some(location) => dispatch(location, &request, &ctx),
             None => Response::error(404, "No location configured for this path"),
         };
 
@@ -169,8 +190,8 @@ fn main() -> std::io::Result<()> {
             let fd = event.u64 as RawFd;
             if let Some((listener, configs)) = listeners.get(&fd) {
                 match listener.accept() {
-                    Ok((stream, _)) => {
-                        if let Err(e) = handle_client(stream, configs) {
+                    Ok((stream, peer_addr)) => {
+                        if let Err(e) = handle_client(stream, configs, peer_addr) {
                             eprintln!("Failed to handle client: {}", e);
                         } else {
                             println!("Handled client");

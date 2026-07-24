@@ -25,9 +25,14 @@ Implemented so far:
 - Name-based virtual hosts: several server blocks can share one listening
   port, disambiguated by the `Host` header, with the first block for that
   address acting as the default when there's no match
+- CGI execution via raw `fork`/`execv`/pipes (no subprocess crate): request
+  body and script stdout are pumped concurrently over non-blocking pipes to
+  avoid deadlocking on a full pipe buffer, full CGI/1.1 environment
+  variables, a `Status:` response header override, a 5s execution timeout
+  (`504`), and `waitpid` reaping so finished scripts never become zombies
 
-Not yet implemented: CGI, multipart uploads, directory listing
-(`autoindex`), and load/stress-test hardening.
+Not yet implemented: multipart uploads, directory listing (`autoindex`),
+and load/stress-test hardening.
 
 **Known limitation:** connection handling is still fully synchronous —
 only the *listening* sockets are multiplexed via `epoll`; an accepted
@@ -52,6 +57,7 @@ curl http://127.0.0.1:8080/
 curl http://127.0.0.1:8080/about
 curl http://127.0.0.1:8081/contact
 curl http://127.0.0.1:8080/ -H "Host: beta.localhost"
+curl "http://127.0.0.1:8080/cgi-bin/hello.sh?foo=bar"
 ```
 
 ## Configuration
@@ -75,7 +81,10 @@ back to the first block declared for that address if there's no header or
 no match. Within a chosen server, requests are matched to the most
 specific (longest-prefix) location whose `path` prefixes the request path,
 then served as a static file rooted at `root` (falling back to `index` for
-directory requests).
+directory requests) — unless the request path's extension is a key in that
+location's `cgi` map, in which case it's executed by the mapped interpreter
+instead (e.g. `"cgi": { "sh": "/bin/sh" }` runs `*.sh` files under that
+location through `/bin/sh`).
 
 ## Testing
 

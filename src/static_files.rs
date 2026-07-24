@@ -86,6 +86,7 @@ mod tests {
             index: index.map(str::to_string),
             methods: vec!["GET".to_string()],
             autoindex: false,
+            cgi: std::collections::HashMap::new(),
         }
     }
 
