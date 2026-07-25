@@ -30,9 +30,16 @@ Implemented so far:
   avoid deadlocking on a full pipe buffer, full CGI/1.1 environment
   variables, a `Status:` response header override, a 5s execution timeout
   (`504`), and `waitpid` reaping so finished scripts never become zombies
+- Real (`multipart/form-data`) file uploads: the filename comes from the
+  part's `Content-Disposition` header rather than the URL, with directory
+  components stripped so it can't be used for traversal; a hand-rolled
+  parser handles binary content containing raw `\r\n` bytes
+- `autoindex`: a generated HTML directory listing when there's no servable
+  index file and the location opts in
+- Per-location `client_max_body_size` (`413` when exceeded), independent
+  of the parser's hard 10MB safety ceiling that applies regardless of config
 
-Not yet implemented: multipart uploads, directory listing (`autoindex`),
-and load/stress-test hardening.
+Not yet implemented: load/stress-test hardening (Phase 9).
 
 **Known limitation:** connection handling is still fully synchronous —
 only the *listening* sockets are multiplexed via `epoll`; an accepted
@@ -58,6 +65,8 @@ curl http://127.0.0.1:8080/about
 curl http://127.0.0.1:8081/contact
 curl http://127.0.0.1:8080/ -H "Host: beta.localhost"
 curl "http://127.0.0.1:8080/cgi-bin/hello.sh?foo=bar"
+curl -F "file=@somefile.png" http://127.0.0.1:8080/upload
+curl http://127.0.0.1:8080/upload/
 ```
 
 ## Configuration
@@ -81,10 +90,12 @@ back to the first block declared for that address if there's no header or
 no match. Within a chosen server, requests are matched to the most
 specific (longest-prefix) location whose `path` prefixes the request path,
 then served as a static file rooted at `root` (falling back to `index` for
-directory requests) — unless the request path's extension is a key in that
-location's `cgi` map, in which case it's executed by the mapped interpreter
-instead (e.g. `"cgi": { "sh": "/bin/sh" }` runs `*.sh` files under that
-location through `/bin/sh`).
+directory requests, or an `autoindex` listing if enabled and there's no
+index) — unless the request path's extension is a key in that location's
+`cgi` map, in which case it's executed by the mapped interpreter instead
+(e.g. `"cgi": { "sh": "/bin/sh" }` runs `*.sh` files under that location
+through `/bin/sh`). `client_max_body_size` (bytes, default 10MB) rejects
+oversized request bodies with `413` before any handler runs.
 
 ## Testing
 

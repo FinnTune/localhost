@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::str;
 
 const MAX_HEADER_BYTES: usize = 8 * 1024;
-const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+// Hard ceiling regardless of any location's configured client_max_body_size
+// (crate::config::DEFAULT_MAX_BODY_SIZE), since routing hasn't happened yet
+// at parse time.
+const MAX_BODY_BYTES: usize = crate::config::DEFAULT_MAX_BODY_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Method {

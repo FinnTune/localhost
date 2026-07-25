@@ -5,7 +5,7 @@
       "locations": [
         { "path": "/", "root": "www/site1", "index": "index.html", "methods": ["GET"], "autoindex": false },
         { "path": "/about", "root": "www/site1", "index": "about.html", "methods": ["GET"], "autoindex": false },
-        { "path": "/upload", "root": "www/uploads", "methods": ["GET", "POST", "DELETE"], "autoindex": false },
+        { "path": "/upload", "root": "www/uploads", "methods": ["GET", "POST", "DELETE"], "autoindex": true, "client_max_body_size": 1048576 },
         { "path": "/cgi-bin", "root": "www/cgi-bin", "methods": ["GET", "POST"], "autoindex": false, "cgi": { "sh": "/bin/sh" } }
       ]
     },

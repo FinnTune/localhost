@@ -384,6 +384,7 @@ mod tests {
             methods: vec!["GET".to_string(), "POST".to_string()],
             autoindex: false,
             cgi: HashMap::new(),
+            client_max_body_size: crate::config::DEFAULT_MAX_BODY_SIZE,
         }
     }
 

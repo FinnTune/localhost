@@ -5,6 +5,7 @@ mod fs_safety;
 mod http;
 mod json;
 mod log;
+mod multipart;
 mod router;
 mod static_files;
 
@@ -71,13 +72,17 @@ fn dispatch(location: &Location, request: &Request, ctx: &CgiContext) -> Respons
             .header("Allow", &location.methods.join(", "));
     }
 
+    if request.body.len() > location.client_max_body_size {
+        return Response::error(413, "Request body exceeds this location's configured limit");
+    }
+
     if let Some(interpreter) = cgi::interpreter_for(location, &request.path) {
         return cgi::execute(location, &interpreter, request, &request.path, ctx);
     }
 
     match request.method {
         Method::Get => static_files::serve(location, &request.path),
-        Method::Post => file_ops::create(location, &request.path, &request.body),
+        Method::Post => file_ops::create(location, request),
         Method::Delete => file_ops::delete(location, &request.path),
         _ => Response::error(501, "Not Implemented"),
     }
@@ -201,5 +206,78 @@ fn main() -> std::io::Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn location(client_max_body_size: usize) -> Location {
+        Location {
+            path: "/upload".to_string(),
+            root: "www".to_string(),
+            index: None,
+            methods: vec!["GET".to_string(), "POST".to_string()],
+            autoindex: false,
+            cgi: HashMap::new(),
+            client_max_body_size,
+        }
+    }
+
+    fn request(method: Method, body: &[u8]) -> Request {
+        Request {
+            method,
+            path: "/upload/note.txt".to_string(),
+            query: None,
+            version: "HTTP/1.1".to_string(),
+            headers: HashMap::new(),
+            body: body.to_vec(),
+        }
+    }
+
+    fn context() -> CgiContext<'static> {
+        CgiContext {
+            server_name: "localhost",
+            server_port: "8080",
+            remote_addr: "127.0.0.1",
+        }
+    }
+
+    #[test]
+    fn dispatch_rejects_disallowed_method() {
+        let location = Location {
+            methods: vec!["GET".to_string()],
+            ..location(1024)
+        };
+        let request = request(Method::Delete, b"");
+
+        let response = dispatch(&location, &request, &context());
+        let text = String::from_utf8(response.to_bytes()).unwrap();
+        assert!(text.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
+        assert!(text.contains("Allow: GET\r\n"));
+    }
+
+    #[test]
+    fn dispatch_rejects_body_over_configured_limit() {
+        let location = location(4);
+        let request = request(Method::Post, b"way too big");
+
+        let response = dispatch(&location, &request, &context());
+        let text = String::from_utf8(response.to_bytes()).unwrap();
+        assert!(text.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
+    }
+
+    #[test]
+    fn dispatch_allows_body_within_configured_limit() {
+        let location = location(1024);
+        let request = request(Method::Delete, b"");
+
+        let response = dispatch(&location, &request, &context());
+        let text = String::from_utf8(response.to_bytes()).unwrap();
+        // Not rejected for size; falls through to the DELETE handler, which
+        // 404s because www/upload/note.txt doesn't exist in the test env.
+        assert!(!text.starts_with("HTTP/1.1 413"));
     }
 }

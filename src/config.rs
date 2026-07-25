@@ -2,18 +2,22 @@ use crate::json::{self, JsonValue};
 use std::collections::HashMap;
 use std::fs;
 
+/// Used both as the parser's hard safety ceiling on any request body
+/// (src/http/request.rs) and as the default for a location's configurable
+/// `client_max_body_size` below.
+pub const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct Location {
     pub path: String,
     pub root: String,
     pub index: Option<String>,
     pub methods: Vec<String>,
-    // Not read yet: directory listing lands in the Phase 8 commit.
-    #[allow(dead_code)]
     pub autoindex: bool,
     /// Maps a file extension (no leading dot, e.g. "sh") to the interpreter
     /// binary that should execute matching scripts as CGI.
     pub cgi: HashMap<String, String>,
+    pub client_max_body_size: usize,
 }
 
 #[derive(Debug)]
@@ -85,6 +89,16 @@ fn location_from_json(value: &JsonValue) -> Result<Location, String> {
         None => HashMap::new(),
     };
 
+    let client_max_body_size = match value.get("client_max_body_size") {
+        Some(JsonValue::Number(n)) if *n >= 0.0 => *n as usize,
+        Some(_) => {
+            return Err(
+                "location field 'client_max_body_size' must be a non-negative number".to_string(),
+            )
+        }
+        None => DEFAULT_MAX_BODY_SIZE,
+    };
+
     Ok(Location {
         path,
         root,
@@ -92,6 +106,7 @@ fn location_from_json(value: &JsonValue) -> Result<Location, String> {
         methods,
         autoindex,
         cgi,
+        client_max_body_size,
     })
 }
 

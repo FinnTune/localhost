@@ -66,6 +66,7 @@ mod tests {
                     methods: vec!["GET".to_string()],
                     autoindex: false,
                     cgi: std::collections::HashMap::new(),
+                    client_max_body_size: crate::config::DEFAULT_MAX_BODY_SIZE,
                 })
                 .collect(),
         }
