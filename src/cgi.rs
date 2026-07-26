@@ -18,6 +18,51 @@ pub struct CgiContext<'a> {
     pub remote_addr: &'a str,
 }
 
+/// A running (forked, exec'd) CGI script and the state needed to pump its
+/// stdin/stdout non-blockingly across multiple event-loop wakeups.
+pub struct CgiProcess {
+    pid: libc::pid_t,
+    stdin_fd: Option<RawFd>,
+    stdout_fd: RawFd,
+    body: Vec<u8>,
+    body_offset: usize,
+    output: Vec<u8>,
+    deadline: Instant,
+}
+
+impl CgiProcess {
+    pub fn pid(&self) -> libc::pid_t {
+        self.pid
+    }
+
+    pub fn stdout_fd(&self) -> RawFd {
+        self.stdout_fd
+    }
+
+    pub fn stdin_fd(&self) -> Option<RawFd> {
+        self.stdin_fd
+    }
+}
+
+pub enum StartOutcome {
+    Started(CgiProcess),
+    Failed(Response),
+}
+
+enum StepOutcome {
+    Continue,
+    Done(Response),
+}
+
+/// Result of one `advance()` step: which pipe fds were closed during this
+/// call (if any — closing happens either because the body finished
+/// writing, or as a side effect of stdout hitting EOF), and the finished
+/// response, if the process is done.
+pub struct AdvanceResult {
+    pub closed_fds: Vec<RawFd>,
+    pub done: Option<Response>,
+}
+
 /// Looks up the CGI interpreter configured for a request path's file
 /// extension under this location, if any (e.g. "sh" -> "/bin/sh").
 pub fn interpreter_for(location: &Location, request_path: &str) -> Option<String> {
@@ -26,14 +71,14 @@ pub fn interpreter_for(location: &Location, request_path: &str) -> Option<String
     location.cgi.get(extension).cloned()
 }
 
-pub fn execute(
+pub fn start(
     location: &Location,
     interpreter: &str,
     request: &Request,
     request_path: &str,
     ctx: &CgiContext,
-) -> Response {
-    execute_with_timeout(
+) -> StartOutcome {
+    start_with_timeout(
         location,
         interpreter,
         request,
@@ -43,42 +88,42 @@ pub fn execute(
     )
 }
 
-fn execute_with_timeout(
+fn start_with_timeout(
     location: &Location,
     interpreter: &str,
     request: &Request,
     request_path: &str,
     ctx: &CgiContext,
     timeout: Duration,
-) -> Response {
+) -> StartOutcome {
     let canonical_root = match fs_safety::canonical_root(&location.root) {
         Ok(root) => root,
-        Err(response) => return response,
+        Err(response) => return StartOutcome::Failed(response),
     };
 
     let relative = fs_safety::relative_path(&location.path, request_path);
     let script_path = Path::new(&location.root).join(relative);
     let canonical_script = match fs::canonicalize(&script_path) {
         Ok(path) => path,
-        Err(_) => return Response::error(404, "Not Found"),
+        Err(_) => return StartOutcome::Failed(Response::error(404, "Not Found")),
     };
     if !fs_safety::within_root(&canonical_script, &canonical_root) {
-        return Response::error(403, "Forbidden");
+        return StartOutcome::Failed(Response::error(403, "Forbidden"));
     }
     if !canonical_script.is_file() {
-        return Response::error(404, "Not Found");
+        return StartOutcome::Failed(Response::error(404, "Not Found"));
     }
 
     let mut stdin_pipe = [0 as RawFd; 2];
     let mut stdout_pipe = [0 as RawFd; 2];
     unsafe {
         if libc::pipe(stdin_pipe.as_mut_ptr()) != 0 {
-            return Response::error(500, "Failed to create CGI stdin pipe");
+            return StartOutcome::Failed(Response::error(500, "Failed to create CGI stdin pipe"));
         }
         if libc::pipe(stdout_pipe.as_mut_ptr()) != 0 {
             libc::close(stdin_pipe[0]);
             libc::close(stdin_pipe[1]);
-            return Response::error(500, "Failed to create CGI stdout pipe");
+            return StartOutcome::Failed(Response::error(500, "Failed to create CGI stdout pipe"));
         }
     }
 
@@ -90,7 +135,7 @@ fn execute_with_timeout(
             libc::close(stdout_pipe[0]);
             libc::close(stdout_pipe[1]);
         }
-        return Response::error(500, "fork() failed");
+        return StartOutcome::Failed(Response::error(500, "fork() failed"));
     }
 
     if pid == 0 {
@@ -117,18 +162,134 @@ fn execute_with_timeout(
     set_nonblocking(stdin_write_fd);
     set_nonblocking(stdout_read_fd);
 
-    let deadline = Instant::now() + timeout;
-    match pump_io(stdin_write_fd, stdout_read_fd, &request.body, deadline) {
-        Ok(output) => {
-            reap(pid, Duration::from_secs(1));
-            parse_cgi_output(&output)
-        }
-        Err(response) => {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-            reap(pid, Duration::from_secs(1));
-            response
+    // An empty body means there's nothing to write: close stdin immediately
+    // so the child sees EOF right away instead of hanging waiting for input.
+    let stdin_fd = if request.body.is_empty() {
+        unsafe { libc::close(stdin_write_fd) };
+        None
+    } else {
+        Some(stdin_write_fd)
+    };
+
+    StartOutcome::Started(CgiProcess {
+        pid,
+        stdin_fd,
+        stdout_fd: stdout_read_fd,
+        body: request.body.clone(),
+        body_offset: 0,
+        output: Vec::new(),
+        deadline: Instant::now() + timeout,
+    })
+}
+
+/// Advances a running CGI process by one step in response to `fd` being
+/// readable/writable. Call this whenever epoll reports activity on either
+/// `process.stdin_fd()` or `process.stdout_fd()`.
+pub fn advance(
+    process: &mut CgiProcess,
+    fd: RawFd,
+    readable: bool,
+    writable: bool,
+) -> AdvanceResult {
+    let mut closed_fds = Vec::new();
+
+    if process.stdin_fd == Some(fd) && writable {
+        let prior_stdin = process.stdin_fd;
+        write_stdin_chunk(process);
+        if prior_stdin.is_some() && process.stdin_fd.is_none() {
+            closed_fds.push(fd);
         }
     }
+
+    let mut done = None;
+    if fd == process.stdout_fd && readable {
+        let prior_stdin = process.stdin_fd;
+        let stdout_fd = process.stdout_fd;
+        if let StepOutcome::Done(response) = read_stdout_chunk(process) {
+            closed_fds.push(stdout_fd);
+            // read_stdout_chunk force-closes stdin too if it was still open;
+            // report that closure if we haven't already (the write-side
+            // branch above only fires when `fd == stdin_fd`, so it can't
+            // have already recorded this for a different `fd`).
+            if let Some(stdin_fd) = prior_stdin {
+                if !closed_fds.contains(&stdin_fd) {
+                    closed_fds.push(stdin_fd);
+                }
+            }
+            done = Some(response);
+        }
+    }
+
+    AdvanceResult { closed_fds, done }
+}
+
+fn write_stdin_chunk(process: &mut CgiProcess) {
+    let Some(stdin_fd) = process.stdin_fd else {
+        return;
+    };
+
+    if process.body_offset < process.body.len() {
+        let chunk_len = (process.body.len() - process.body_offset).min(READ_CHUNK);
+        let n = unsafe {
+            libc::write(
+                stdin_fd,
+                process.body[process.body_offset..].as_ptr() as *const libc::c_void,
+                chunk_len,
+            )
+        };
+        if n > 0 {
+            process.body_offset += n as usize;
+        }
+        // n <= 0: spurious wakeup (EAGAIN) or transient error; try again next event.
+    }
+
+    if process.body_offset >= process.body.len() {
+        unsafe { libc::close(stdin_fd) };
+        process.stdin_fd = None;
+    }
+}
+
+fn read_stdout_chunk(process: &mut CgiProcess) -> StepOutcome {
+    let mut chunk = [0u8; READ_CHUNK];
+    let n = unsafe {
+        libc::read(
+            process.stdout_fd,
+            chunk.as_mut_ptr() as *mut libc::c_void,
+            chunk.len(),
+        )
+    };
+    if n > 0 {
+        process.output.extend_from_slice(&chunk[..n as usize]);
+        StepOutcome::Continue
+    } else if n == 0 {
+        if let Some(stdin_fd) = process.stdin_fd.take() {
+            unsafe { libc::close(stdin_fd) };
+        }
+        unsafe { libc::close(process.stdout_fd) };
+        StepOutcome::Done(parse_cgi_output(&process.output))
+    } else {
+        // n < 0: spurious wakeup (EAGAIN) or transient error; try again next event.
+        StepOutcome::Continue
+    }
+}
+
+pub fn is_expired(process: &CgiProcess, now: Instant) -> bool {
+    now >= process.deadline
+}
+
+/// Sends SIGKILL to a CGI process (e.g. on timeout). Does not reap it —
+/// the caller is expected to hand the pid to a non-blocking reap sweep.
+pub fn kill(process: &CgiProcess) {
+    unsafe { libc::kill(process.pid, libc::SIGKILL) };
+}
+
+/// Closes a running process's pipe fds without waiting for it to finish;
+/// used when abandoning a CGI process on timeout, before killing it.
+pub fn close_pipes(process: &mut CgiProcess) {
+    if let Some(stdin_fd) = process.stdin_fd.take() {
+        unsafe { libc::close(stdin_fd) };
+    }
+    unsafe { libc::close(process.stdout_fd) };
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -184,116 +345,6 @@ fn set_nonblocking(fd: RawFd) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL, 0);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
-}
-
-/// Concurrently writes `body` to the child's stdin and reads its stdout,
-/// so a script that echoes input as it arrives can't deadlock against a
-/// full pipe buffer in either direction. Returns the collected stdout once
-/// the child closes it (EOF), or an error response on timeout/I/O failure.
-fn pump_io(
-    stdin_write_fd: RawFd,
-    stdout_read_fd: RawFd,
-    body: &[u8],
-    deadline: Instant,
-) -> Result<Vec<u8>, Response> {
-    let mut output = Vec::new();
-    let mut body_offset = 0usize;
-    let mut stdin_open = true;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Response::error(504, "CGI script timed out"));
-        }
-
-        let mut fds = Vec::with_capacity(2);
-        if stdin_open {
-            fds.push(libc::pollfd {
-                fd: stdin_write_fd,
-                events: libc::POLLOUT,
-                revents: 0,
-            });
-        }
-        fds.push(libc::pollfd {
-            fd: stdout_read_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-
-        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as i32;
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
-        if ready < 0 {
-            if stdin_open {
-                unsafe { libc::close(stdin_write_fd) };
-            }
-            unsafe { libc::close(stdout_read_fd) };
-            return Err(Response::error(500, "CGI I/O poll failed"));
-        }
-
-        for pfd in &fds {
-            if pfd.fd == stdout_read_fd && pfd.revents != 0 {
-                let mut chunk = [0u8; READ_CHUNK];
-                let n = unsafe {
-                    libc::read(
-                        stdout_read_fd,
-                        chunk.as_mut_ptr() as *mut libc::c_void,
-                        chunk.len(),
-                    )
-                };
-                if n > 0 {
-                    output.extend_from_slice(&chunk[..n as usize]);
-                } else if n == 0 {
-                    if stdin_open {
-                        unsafe { libc::close(stdin_write_fd) };
-                    }
-                    unsafe { libc::close(stdout_read_fd) };
-                    return Ok(output);
-                }
-                // n < 0: spurious wakeup (EAGAIN) or transient error; loop again.
-            }
-
-            if stdin_open && pfd.fd == stdin_write_fd && pfd.revents & libc::POLLOUT != 0 {
-                if body_offset < body.len() {
-                    let chunk_len = (body.len() - body_offset).min(READ_CHUNK);
-                    let n = unsafe {
-                        libc::write(
-                            stdin_write_fd,
-                            body[body_offset..].as_ptr() as *const libc::c_void,
-                            chunk_len,
-                        )
-                    };
-                    if n > 0 {
-                        body_offset += n as usize;
-                    }
-                }
-                if body_offset >= body.len() {
-                    unsafe { libc::close(stdin_write_fd) };
-                    stdin_open = false;
-                }
-            }
-        }
-    }
-}
-
-/// Reaps the child, waiting briefly for a natural exit before giving up
-/// (the caller is responsible for killing it first if that's warranted).
-fn reap(pid: libc::pid_t, patience: Duration) {
-    let deadline = Instant::now() + patience;
-    loop {
-        let mut status = 0;
-        let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        if result != 0 {
-            return;
-        }
-        if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, &mut status, 0);
-            }
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -404,6 +455,90 @@ mod tests {
             server_name: "localhost",
             server_port: "8080",
             remote_addr: "127.0.0.1",
+        }
+    }
+
+    /// Drives a CgiProcess to completion using a real poll() loop, mirroring
+    /// what connection.rs's event-driven dispatch does one step at a time.
+    /// Test-only: production code never blocks like this.
+    fn run_to_completion(mut process: CgiProcess, timeout: Duration) -> Response {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                kill(&process);
+                close_pipes(&mut process);
+                return Response::error(504, "CGI script timed out");
+            }
+
+            let mut fds = Vec::with_capacity(2);
+            if let Some(stdin_fd) = process.stdin_fd {
+                fds.push(libc::pollfd {
+                    fd: stdin_fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                });
+            }
+            fds.push(libc::pollfd {
+                fd: process.stdout_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+
+            let remaining_ms = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .min(i32::MAX as u128) as i32;
+            let ready =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, remaining_ms) };
+            if ready < 0 {
+                close_pipes(&mut process);
+                return Response::error(500, "CGI I/O poll failed");
+            }
+
+            for pfd in &fds {
+                // Any nonzero revents (not just POLLIN/POLLOUT specifically)
+                // means "try the syscall": a closed peer reports POLLHUP,
+                // sometimes without POLLIN also set, and read() is what
+                // correctly turns that into an EOF/Done detection.
+                let readable = pfd.fd == process.stdout_fd && pfd.revents != 0;
+                let writable = Some(pfd.fd) == process.stdin_fd && pfd.revents != 0;
+                if readable || writable {
+                    if let Some(response) = advance(&mut process, pfd.fd, readable, writable).done {
+                        return response;
+                    }
+                }
+            }
+        }
+    }
+
+    fn execute(
+        location: &Location,
+        interpreter: &str,
+        request: &Request,
+        request_path: &str,
+        ctx: &CgiContext,
+    ) -> Response {
+        execute_with_timeout(
+            location,
+            interpreter,
+            request,
+            request_path,
+            ctx,
+            CGI_TIMEOUT,
+        )
+    }
+
+    fn execute_with_timeout(
+        location: &Location,
+        interpreter: &str,
+        request: &Request,
+        request_path: &str,
+        ctx: &CgiContext,
+        timeout: Duration,
+    ) -> Response {
+        match start_with_timeout(location, interpreter, request, request_path, ctx, timeout) {
+            StartOutcome::Failed(response) => response,
+            StartOutcome::Started(process) => run_to_completion(process, timeout),
         }
     }
 
@@ -525,5 +660,37 @@ mod tests {
         );
         let text = String::from_utf8(response.to_bytes()).unwrap();
         assert!(text.starts_with("HTTP/1.1 504 Gateway Timeout\r\n"));
+    }
+
+    #[test]
+    fn is_expired_reports_past_deadline() {
+        let root = temp_dir("expiry_check");
+        fs::write(root.join("script.sh"), "#!/bin/sh\necho ''\n").unwrap();
+        let location = location(&root);
+        let req = request(Method::Get, b"");
+
+        match start_with_timeout(
+            &location,
+            "/bin/sh",
+            &req,
+            "/cgi-bin/script.sh",
+            &context(),
+            Duration::from_millis(0),
+        ) {
+            StartOutcome::Started(mut process) => {
+                std::thread::sleep(Duration::from_millis(5));
+                assert!(is_expired(&process, Instant::now()));
+                kill(&process);
+                close_pipes(&mut process);
+                unsafe {
+                    let mut status = 0;
+                    libc::waitpid(process.pid, &mut status, 0);
+                }
+            }
+            StartOutcome::Failed(response) => panic!(
+                "expected process to start, got: {}",
+                String::from_utf8_lossy(&response.to_bytes())
+            ),
+        }
     }
 }

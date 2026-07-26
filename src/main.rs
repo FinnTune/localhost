@@ -1,5 +1,6 @@
 mod cgi;
 mod config;
+mod connection;
 mod file_ops;
 mod fs_safety;
 mod http;
@@ -9,125 +10,162 @@ mod multipart;
 mod router;
 mod static_files;
 
-use cgi::CgiContext;
-use config::{load_config, Location, ServerConfig};
-use http::{Method, ParseOutcome, Request, Response};
-use libc::{epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLIN, EPOLL_CTL_ADD};
+use config::{load_config, ServerConfig};
+use connection::{Connection, Outcome};
+use libc::{
+    epoll_create1, epoll_ctl, epoll_event, epoll_wait, EPOLLERR, EPOLLHUP, EPOLLIN, EPOLLOUT,
+    EPOLL_CTL_ADD,
+};
 use log::{blue, green};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const IDLE_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_EVENTS: usize = 128;
+/// epoll_wait's timeout: bounds how stale idle/CGI-timeout sweeps can get
+/// when there's no I/O activity to wake us up otherwise.
+const SWEEP_INTERVAL_MS: i32 = 1000;
+/// How long to keep politely asking a killed CGI child to be reaped before
+/// giving up (it should die almost immediately after SIGKILL).
+const REAP_PATIENCE: Duration = Duration::from_secs(2);
 
-/// Parses the next request off `buffer` (which may already hold pipelined
-/// bytes left over from a previous request on this connection), reading
-/// more from the socket as needed. Returns the request plus whatever bytes
-/// after it haven't been consumed yet, so the caller can feed them straight
-/// back in for the next request on a persistent connection.
-fn read_request(
-    stream: &mut TcpStream,
-    mut buffer: Vec<u8>,
-) -> std::io::Result<Option<(Request, Vec<u8>)>> {
-    let mut chunk = [0u8; 4096];
+/// What kind of fd an epoll event belongs to, so the main loop knows how
+/// to route it.
+#[derive(Clone, Copy)]
+enum FdRole {
+    Listener(usize),
+    Client,
+    /// A CGI pipe fd (stdin or stdout); the client fd that owns it.
+    CgiPipe(RawFd),
+}
 
-    loop {
-        match http::request::parse(&buffer) {
-            ParseOutcome::Complete { request, consumed } => {
-                let remaining = buffer[consumed..].to_vec();
-                return Ok(Some((request, remaining)));
+fn epoll_add(epoll_fd: RawFd, fd: RawFd, events: u32) {
+    let mut event = epoll_event {
+        events,
+        u64: fd as u64,
+    };
+    unsafe {
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &mut event);
+    }
+}
+
+/// Applies the bookkeeping side effects of a `connection::Outcome`: keeping
+/// `connections`/`fd_roles` in sync, and queuing CGI pids for reaping.
+/// Epoll registration for the client socket itself is handled inside
+/// `Connection`; this only concerns the extra CGI pipe fds and the
+/// connection's lifetime in our own maps.
+fn apply_outcome(
+    client_fd: RawFd,
+    conn: Connection,
+    outcome: Outcome,
+    connections: &mut HashMap<RawFd, Connection>,
+    fd_roles: &mut HashMap<RawFd, FdRole>,
+    pending_reaps: &mut Vec<(libc::pid_t, Instant)>,
+) {
+    match outcome {
+        Outcome::Continue => {
+            connections.insert(client_fd, conn);
+        }
+        Outcome::RegisterCgi {
+            stdout_fd,
+            stdin_fd,
+        } => {
+            fd_roles.insert(stdout_fd, FdRole::CgiPipe(client_fd));
+            if let Some(stdin_fd) = stdin_fd {
+                fd_roles.insert(stdin_fd, FdRole::CgiPipe(client_fd));
             }
-            ParseOutcome::Invalid { status, message } => {
-                let response = Response::error(status, &message);
-                stream.write_all(&response.to_bytes())?;
-                stream.flush()?;
-                return Ok(None);
+            connections.insert(client_fd, conn);
+        }
+        Outcome::UnregisterCgiFds(fds) => {
+            for fd in fds {
+                fd_roles.remove(&fd);
             }
-            ParseOutcome::Incomplete => match stream.read(&mut chunk) {
-                Ok(0) => return Ok(None), // client closed before a complete request arrived
-                Ok(n) => buffer.extend_from_slice(&chunk[..n]),
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                    ) =>
-                {
-                    return Ok(None); // idle too long; drop the connection
-                }
-                Err(e) => return Err(e),
-            },
+            connections.insert(client_fd, conn);
+        }
+        Outcome::CgiFinished { closed_fds, pid } => {
+            for fd in closed_fds {
+                fd_roles.remove(&fd);
+            }
+            pending_reaps.push((pid, Instant::now() + REAP_PATIENCE));
+            connections.insert(client_fd, conn);
+        }
+        Outcome::Close => {
+            close_connection(client_fd, conn, fd_roles, pending_reaps);
         }
     }
 }
 
-fn dispatch(location: &Location, request: &Request, ctx: &CgiContext) -> Response {
-    if !location
-        .methods
-        .iter()
-        .any(|allowed| allowed == request.method.as_str())
-    {
-        return Response::error(405, "Method Not Allowed")
-            .header("Allow", &location.methods.join(", "));
+/// Tears down a connection: abandons any live CGI process (killing it and
+/// queuing its pid for reaping), drops its pipe fds from `fd_roles`, and
+/// removes the client fd itself. The connection's `TcpStream` closes when
+/// `conn` is dropped at the end of this function.
+fn close_connection(
+    client_fd: RawFd,
+    mut conn: Connection,
+    fd_roles: &mut HashMap<RawFd, FdRole>,
+    pending_reaps: &mut Vec<(libc::pid_t, Instant)>,
+) {
+    if let Some((fds, pid)) = conn.abandon_cgi() {
+        for fd in fds {
+            fd_roles.remove(&fd);
+        }
+        pending_reaps.push((pid, Instant::now() + REAP_PATIENCE));
     }
-
-    if request.body.len() > location.client_max_body_size {
-        return Response::error(413, "Request body exceeds this location's configured limit");
-    }
-
-    if let Some(interpreter) = cgi::interpreter_for(location, &request.path) {
-        return cgi::execute(location, &interpreter, request, &request.path, ctx);
-    }
-
-    match request.method {
-        Method::Get => static_files::serve(location, &request.path),
-        Method::Post => file_ops::create(location, request),
-        Method::Delete => file_ops::delete(location, &request.path),
-        _ => Response::error(501, "Not Implemented"),
-    }
+    fd_roles.remove(&client_fd);
 }
 
-fn handle_client(
-    mut stream: TcpStream,
-    configs: &[&ServerConfig],
-    peer_addr: SocketAddr,
-) -> std::io::Result<()> {
-    stream.set_read_timeout(Some(IDLE_READ_TIMEOUT))?;
-    let mut leftover = Vec::new();
-    let remote_addr = peer_addr.ip().to_string();
+/// One non-blocking `waitpid(WNOHANG)` attempt per pending pid; anything
+/// past its own deadline gets SIGKILLed again (harmless if already dead)
+/// and stays queued for the next pass. Never blocks the event loop.
+fn reap_pending(pending: &mut Vec<(libc::pid_t, Instant)>) {
+    let now = Instant::now();
+    pending.retain(|(pid, deadline)| {
+        let mut status = 0;
+        let result = unsafe { libc::waitpid(*pid, &mut status, libc::WNOHANG) };
+        if result != 0 {
+            return false; // reaped (or ECHILD - already gone); stop tracking
+        }
+        if now >= *deadline {
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        true
+    });
+}
 
-    loop {
-        let (request, remaining) = match read_request(&mut stream, leftover)? {
-            Some(pair) => pair,
-            None => return Ok(()),
-        };
-        leftover = remaining;
+/// Closes any connection idle too long, and times out any CGI process past
+/// its own deadline (writing a 504 instead of dropping the connection).
+fn sweep_timeouts(
+    connections: &mut HashMap<RawFd, Connection>,
+    fd_roles: &mut HashMap<RawFd, FdRole>,
+    pending_reaps: &mut Vec<(libc::pid_t, Instant)>,
+) {
+    let now = Instant::now();
 
-        println!("Request: {} {}", request.method.as_str(), request.path);
+    let expired_cgi: Vec<RawFd> = connections
+        .iter()
+        .filter(|(_, conn)| conn.cgi_deadline_passed(now))
+        .map(|(fd, _)| *fd)
+        .collect();
+    for fd in expired_cgi {
+        if let Some(conn) = connections.get_mut(&fd) {
+            let (fds, pid) = conn.timeout_cgi();
+            for fd in fds {
+                fd_roles.remove(&fd);
+            }
+            pending_reaps.push((pid, Instant::now() + REAP_PATIENCE));
+        }
+    }
 
-        let server = router::select_server(configs, request.header("host"));
-        let (server_host, server_port) = server
-            .address
-            .rsplit_once(':')
-            .unwrap_or((server.address.as_str(), ""));
-        let ctx = CgiContext {
-            server_name: server.server_name.as_deref().unwrap_or(server_host),
-            server_port,
-            remote_addr: &remote_addr,
-        };
-
-        let response = match router::match_location(server, &request.path) {
-            Some(location) => dispatch(location, &request, &ctx),
-            None => Response::error(404, "No location configured for this path"),
-        };
-
-        let keep_alive = request.keep_alive();
-        stream.write_all(&response.to_bytes())?;
-        stream.flush()?;
-
-        if !keep_alive {
-            return Ok(());
+    let idle: Vec<RawFd> = connections
+        .iter()
+        .filter(|(_, conn)| conn.idle_timed_out(now, IDLE_READ_TIMEOUT))
+        .map(|(fd, _)| *fd)
+        .collect();
+    for fd in idle {
+        if let Some(conn) = connections.remove(&fd) {
+            close_connection(fd, conn, fd_roles, pending_reaps);
         }
     }
 }
@@ -140,51 +178,60 @@ fn main() -> std::io::Result<()> {
         panic!("Failed to create epoll instance");
     }
 
-    // Group server blocks by listening address: several blocks can share one
-    // port and are disambiguated later by Host header (name-based virtual
-    // hosting), so we bind each unique address only once.
-    let mut groups: HashMap<&str, Vec<&ServerConfig>> = HashMap::new();
-    for server_config in &config.servers {
-        groups
-            .entry(server_config.address.as_str())
-            .or_default()
-            .push(server_config);
+    // Group server blocks by listening address: several blocks can share
+    // one port and are disambiguated later by Host header (name-based
+    // virtual hosting), so each unique address is bound only once. `groups`
+    // is indexed by group_id, which `Connection` uses to look its servers
+    // back up without needing a lifetime parameter tying it to `config`.
+    let mut addresses: Vec<String> = Vec::new();
+    let mut groups: Vec<Vec<ServerConfig>> = Vec::new();
+    for server_config in config.servers {
+        match addresses.iter().position(|a| a == &server_config.address) {
+            Some(group_id) => groups[group_id].push(server_config),
+            None => {
+                addresses.push(server_config.address.clone());
+                groups.push(vec![server_config]);
+            }
+        }
     }
 
-    let mut listeners = HashMap::new();
+    let mut fd_roles: HashMap<RawFd, FdRole> = HashMap::new();
+    let mut listeners: Vec<TcpListener> = Vec::new();
 
-    for (address, server_configs) in groups {
+    for (group_id, address) in addresses.iter().enumerate() {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let fd = listener.as_raw_fd();
+        epoll_add(epoll_fd, fd, EPOLLIN as u32);
+        fd_roles.insert(fd, FdRole::Listener(group_id));
 
-        let mut event = epoll_event {
-            events: EPOLLIN as u32,
-            u64: fd as u64,
-        };
-
-        unsafe {
-            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &mut event);
-        }
-
-        let names: Vec<&str> = server_configs
+        let names: Vec<&str> = groups[group_id]
             .iter()
             .map(|c| c.server_name.as_deref().unwrap_or("default"))
             .collect();
-
-        listeners.insert(fd, (listener, server_configs));
-
         println!(
             "Server up and running on {}: {} ({})",
             blue(address),
             green("✓"),
             names.join(", ")
         );
+
+        listeners.push(listener);
     }
 
+    let mut connections: HashMap<RawFd, Connection> = HashMap::new();
+    let mut pending_reaps: Vec<(libc::pid_t, Instant)> = Vec::new();
+
     loop {
-        let mut events = [epoll_event { events: 0, u64: 0 }; 10];
-        let num_events = unsafe { epoll_wait(epoll_fd, events.as_mut_ptr(), 10, -1) };
+        let mut events = [epoll_event { events: 0, u64: 0 }; MAX_EVENTS];
+        let num_events = unsafe {
+            epoll_wait(
+                epoll_fd,
+                events.as_mut_ptr(),
+                MAX_EVENTS as i32,
+                SWEEP_INTERVAL_MS,
+            )
+        };
 
         if num_events == -1 {
             eprintln!("Error in epoll wait");
@@ -193,91 +240,63 @@ fn main() -> std::io::Result<()> {
 
         for event in events.iter().take(num_events as usize) {
             let fd = event.u64 as RawFd;
-            if let Some((listener, configs)) = listeners.get(&fd) {
-                match listener.accept() {
+            // EPOLLHUP/EPOLLERR are always implicitly monitored and can
+            // fire without EPOLLIN also set (e.g. a pipe's write end
+            // closing) — treat them as "readable" too so the resulting
+            // read() call is what turns that into a proper EOF/error
+            // detection, rather than silently never noticing.
+            let readable = event.events & (EPOLLIN as u32 | EPOLLHUP as u32 | EPOLLERR as u32) != 0;
+            let writable = event.events & (EPOLLOUT as u32) != 0;
+
+            match fd_roles.get(&fd).copied() {
+                Some(FdRole::Listener(group_id)) => match listeners[group_id].accept() {
                     Ok((stream, peer_addr)) => {
-                        if let Err(e) = handle_client(stream, configs, peer_addr) {
-                            eprintln!("Failed to handle client: {}", e);
-                        } else {
-                            println!("Handled client");
+                        match Connection::accept(stream, peer_addr, group_id, epoll_fd) {
+                            Ok(conn) => {
+                                let client_fd = conn.fd();
+                                fd_roles.insert(client_fd, FdRole::Client);
+                                connections.insert(client_fd, conn);
+                            }
+                            Err(e) => eprintln!("Failed to prepare connection: {}", e),
                         }
                     }
                     Err(e) => eprintln!("Failed to accept connection: {}", e),
+                },
+                Some(FdRole::Client) => {
+                    if let Some(mut conn) = connections.remove(&fd) {
+                        let outcome = if readable {
+                            conn.on_readable(&groups)
+                        } else {
+                            conn.on_writable(&groups)
+                        };
+                        apply_outcome(
+                            fd,
+                            conn,
+                            outcome,
+                            &mut connections,
+                            &mut fd_roles,
+                            &mut pending_reaps,
+                        );
+                    }
                 }
+                Some(FdRole::CgiPipe(owner_fd)) => {
+                    if let Some(mut conn) = connections.remove(&owner_fd) {
+                        let outcome = conn.on_cgi_event(fd, readable, writable);
+                        apply_outcome(
+                            owner_fd,
+                            conn,
+                            outcome,
+                            &mut connections,
+                            &mut fd_roles,
+                            &mut pending_reaps,
+                        );
+                    }
+                }
+                None => {} // stale event for an fd we've already cleaned up
             }
         }
-    }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn location(client_max_body_size: usize) -> Location {
-        Location {
-            path: "/upload".to_string(),
-            root: "www".to_string(),
-            index: None,
-            methods: vec!["GET".to_string(), "POST".to_string()],
-            autoindex: false,
-            cgi: HashMap::new(),
-            client_max_body_size,
-        }
-    }
-
-    fn request(method: Method, body: &[u8]) -> Request {
-        Request {
-            method,
-            path: "/upload/note.txt".to_string(),
-            query: None,
-            version: "HTTP/1.1".to_string(),
-            headers: HashMap::new(),
-            body: body.to_vec(),
-        }
-    }
-
-    fn context() -> CgiContext<'static> {
-        CgiContext {
-            server_name: "localhost",
-            server_port: "8080",
-            remote_addr: "127.0.0.1",
-        }
-    }
-
-    #[test]
-    fn dispatch_rejects_disallowed_method() {
-        let location = Location {
-            methods: vec!["GET".to_string()],
-            ..location(1024)
-        };
-        let request = request(Method::Delete, b"");
-
-        let response = dispatch(&location, &request, &context());
-        let text = String::from_utf8(response.to_bytes()).unwrap();
-        assert!(text.starts_with("HTTP/1.1 405 Method Not Allowed\r\n"));
-        assert!(text.contains("Allow: GET\r\n"));
-    }
-
-    #[test]
-    fn dispatch_rejects_body_over_configured_limit() {
-        let location = location(4);
-        let request = request(Method::Post, b"way too big");
-
-        let response = dispatch(&location, &request, &context());
-        let text = String::from_utf8(response.to_bytes()).unwrap();
-        assert!(text.starts_with("HTTP/1.1 413 Payload Too Large\r\n"));
-    }
-
-    #[test]
-    fn dispatch_allows_body_within_configured_limit() {
-        let location = location(1024);
-        let request = request(Method::Delete, b"");
-
-        let response = dispatch(&location, &request, &context());
-        let text = String::from_utf8(response.to_bytes()).unwrap();
-        // Not rejected for size; falls through to the DELETE handler, which
-        // 404s because www/upload/note.txt doesn't exist in the test env.
-        assert!(!text.starts_with("HTTP/1.1 413"));
+        sweep_timeouts(&mut connections, &mut fd_roles, &mut pending_reaps);
+        reap_pending(&mut pending_reaps);
     }
 }
