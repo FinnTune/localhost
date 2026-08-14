@@ -132,39 +132,33 @@ current.
 
 ## Stress testing
 
-With the server running (`cargo run`), a concurrent load test against a mix
-of static and CGI endpoints:
-
 ```sh
-printf '%s\n' \
-  'http://127.0.0.1:8080/' \
-  'http://127.0.0.1:8080/about' \
-  'http://127.0.0.1:8080/cgi-bin/hello.sh?x=1' > /tmp/urls.txt
-siege -c 25 -t 30S -f /tmp/urls.txt
+scripts/stress.sh
 ```
 
-Verify no resource leaks across the run:
+Builds the server, starts it (or reuses an already-running instance if
+it's genuinely `target/debug/localhost` — it checks the port owner's
+`/proc/<pid>/exe` before reusing it, rather than assuming anything that
+answers HTTP on that port is safe to test against), then runs everything
+that used to be a manual checklist:
 
-```sh
-ls /proc/$(pgrep -f target/debug/localhost)/fd | wc -l   # fd count, before vs. after
-ps aux | grep '[d]efunct'                                  # zombie CGI children (should be empty)
-```
+- a `siege`-driven concurrent load test against a mix of static and CGI
+  endpoints (falls back to a burst of parallel `curl`s if `siege` isn't
+  installed), asserting 100% availability
+- an fd-count diff across the run to catch resource leaks
+- a `ps aux | grep defunct` check for zombie CGI children
+- **the concurrency proof**: holds one connection open and idle, then
+  fires a second client concurrently — it must be served immediately
+  rather than waiting out the idle timeout, which is the whole point of
+  the `epoll`-based design (see Architecture above)
+- a malformed-input pass (garbage bytes, an oversized header past the 8KB
+  limit, a `Content-Length` far larger than the actual body) confirming
+  the server keeps answering `200` to well-formed requests afterward
+  instead of crashing or wedging
 
-To confirm concurrency actually works (not just throughput under a
-well-behaved load), hold one connection open and idle, then fire a second
-client — it should succeed immediately rather than waiting out the 30s idle
-timeout:
-
-```sh
-(exec 3<>/dev/tcp/127.0.0.1/8080; sleep 8) &
-curl -w '%{time_total}\n' http://127.0.0.1:8080/
-```
-
-Malformed/adversarial input (garbage bytes, no CRLF, oversized headers, a
-false `Content-Length` far larger than the actual body) should never crash
-the server or cause it to stop responding to well-formed requests
-afterward — send it raw over `/dev/tcp` and confirm a subsequent `curl`
-still gets a `200`.
+Exits non-zero if anything fails. `HOST`/`PORT`/`SIEGE_CONCURRENCY`/
+`SIEGE_TIME` are overridable via env vars if you point it at a different
+config.
 
 ## License
 
