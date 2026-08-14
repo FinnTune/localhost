@@ -250,6 +250,13 @@ impl Connection {
     }
 
     fn enter_writing(&mut self, response: Response, keep_alive: bool) {
+        // Tell the client what we've already decided, rather than leaving
+        // it to guess from how the socket behaves afterward — required for
+        // HTTP/1.0 keep-alive (off by default; the client only reuses the
+        // connection if we opt in here) and good practice for HTTP/1.1
+        // close.
+        let connection_value = if keep_alive { "keep-alive" } else { "close" };
+        let response = response.header("Connection", connection_value);
         let buf = response.to_bytes();
         self.state = ConnState::Writing {
             buf,

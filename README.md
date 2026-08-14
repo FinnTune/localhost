@@ -42,8 +42,15 @@ Implemented so far:
   all share one `epoll` instance (see Architecture below), so a slow or
   idle client can no longer block any other client
 - Access logging in Combined Log Format (the format nginx/Apache use) to
-  stdout, one line per response — including CGI and error responses,
-  timestamped via `libc::strftime` rather than a `time`/`chrono` crate
+  stdout, one line per response — including CGI and error responses
+- Spec-compliant response headers: `Date` and `Server` on every response,
+  and an explicit `Connection: keep-alive`/`close` reflecting what the
+  server actually decided (rather than leaving HTTP/1.0 clients to guess),
+  plus `505 HTTP Version Not Supported` for anything other than 1.0/1.1.
+  `Date`/access-log timestamps are hand-formatted from `libc::gmtime_r`/
+  `localtime_r`'s raw fields rather than `strftime`'s locale-dependent
+  `%a`/`%b`, so month/weekday names can't silently break the wire format
+  on a non-English `LC_TIME`
 
 All nine planned phases are done.
 

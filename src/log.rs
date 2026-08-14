@@ -8,9 +8,17 @@ pub fn blue(s: &str) -> String {
     format!("\x1b[34m{}\x1b[0m", s)
 }
 
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
 /// Current local time as `10/Oct/2023:13:55:36 +0000`, the timestamp format
-/// Combined Log Format uses. Hand-rolled via `libc::strftime` rather than a
-/// `time`/`chrono` crate, matching this repo's libc-only dependency policy.
+/// Combined Log Format uses. Built from `libc::localtime_r`'s raw `tm`
+/// fields (including the glibc `tm_gmtoff` extension for the numeric UTC
+/// offset) rather than `strftime`'s `%b`/`%z`, since `%b` is affected by the
+/// process's locale (`LC_TIME`) and would silently produce month
+/// abbreviations Combined Log Format doesn't expect on any non-English
+/// locale.
 fn timestamp() -> String {
     unsafe {
         let mut t: libc::time_t = 0;
@@ -18,16 +26,22 @@ fn timestamp() -> String {
         let mut tm: libc::tm = std::mem::zeroed();
         libc::localtime_r(&t, &mut tm);
 
-        let fmt = b"%d/%b/%Y:%H:%M:%S %z\0";
-        let mut buf = [0 as libc::c_char; 32];
-        let len = libc::strftime(
-            buf.as_mut_ptr(),
-            buf.len(),
-            fmt.as_ptr() as *const libc::c_char,
-            &tm,
-        );
-        let bytes: Vec<u8> = buf[..len].iter().map(|&c| c as u8).collect();
-        String::from_utf8_lossy(&bytes).into_owned()
+        let offset_minutes = tm.tm_gmtoff / 60;
+        let sign = if offset_minutes < 0 { '-' } else { '+' };
+        let offset_minutes = offset_minutes.abs();
+
+        format!(
+            "{:02}/{}/{}:{:02}:{:02}:{:02} {}{:02}{:02}",
+            tm.tm_mday,
+            MONTHS[tm.tm_mon as usize],
+            1900 + tm.tm_year,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            sign,
+            offset_minutes / 60,
+            offset_minutes % 60,
+        )
     }
 }
 

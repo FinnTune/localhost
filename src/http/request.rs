@@ -81,6 +81,7 @@ impl Request {
 /// Result of feeding the accumulated connection buffer to the parser.
 /// `Incomplete` means more bytes are needed before a decision can be made;
 /// callers should keep reading and re-parse from the start of the buffer.
+#[derive(Debug)]
 pub enum ParseOutcome {
     Incomplete,
     Complete { request: Request, consumed: usize },
@@ -134,6 +135,12 @@ pub fn parse(buffer: &[u8]) -> ParseOutcome {
         return ParseOutcome::Invalid {
             status: 400,
             message: format!("Unsupported protocol version: '{}'", version),
+        };
+    }
+    if version != "HTTP/1.0" && version != "HTTP/1.1" {
+        return ParseOutcome::Invalid {
+            status: 505,
+            message: format!("Unsupported HTTP version: '{}'", version),
         };
     }
 
@@ -342,6 +349,37 @@ mod tests {
         match parse(raw) {
             ParseOutcome::Invalid { status, .. } => assert_eq!(status, 400),
             _ => panic!("expected Invalid(400)"),
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_http_version() {
+        let raw = b"GET / HTTP/2.0\r\nHost: a\r\n\r\n";
+        match parse(raw) {
+            ParseOutcome::Invalid { status, .. } => assert_eq!(status, 505),
+            other => panic!("expected Invalid(505), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_headers() {
+        let mut raw = b"GET / HTTP/1.1\r\n".to_vec();
+        raw.extend(std::iter::repeat_n(b'a', MAX_HEADER_BYTES + 1));
+        match parse(&raw) {
+            ParseOutcome::Invalid { status, .. } => assert_eq!(status, 431),
+            other => panic!("expected Invalid(431), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_body() {
+        let raw = format!(
+            "POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        match parse(raw.as_bytes()) {
+            ParseOutcome::Invalid { status, .. } => assert_eq!(status, 413),
+            other => panic!("expected Invalid(413), got {other:?}"),
         }
     }
 
