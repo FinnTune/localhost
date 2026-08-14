@@ -163,6 +163,19 @@ pub fn parse(buffer: &[u8]) -> ParseOutcome {
         headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
     }
 
+    // RFC 7230 SS3.3.3 rule 3: a request with both headers has ambiguous
+    // framing — some intermediary in the chain might honor Content-Length
+    // while another honors Transfer-Encoding, letting an attacker smuggle a
+    // second, hidden request past whichever one gets it wrong. The spec
+    // permits favoring Transfer-Encoding and discarding Content-Length
+    // instead, but outright rejecting is the safer, unambiguous choice.
+    if headers.contains_key("transfer-encoding") && headers.contains_key("content-length") {
+        return ParseOutcome::Invalid {
+            status: 400,
+            message: "Request has both Content-Length and Transfer-Encoding".to_string(),
+        };
+    }
+
     let body_start = header_end + 4;
     let is_chunked = headers
         .get("transfer-encoding")
@@ -358,6 +371,15 @@ mod tests {
         match parse(raw) {
             ParseOutcome::Invalid { status, .. } => assert_eq!(status, 505),
             other => panic!("expected Invalid(505), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_both_content_length_and_transfer_encoding() {
+        let raw = b"POST /submit HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+        match parse(raw) {
+            ParseOutcome::Invalid { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected Invalid(400), got {other:?}"),
         }
     }
 

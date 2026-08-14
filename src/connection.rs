@@ -318,11 +318,16 @@ impl Connection {
             }
         };
 
-        if !location
+        // A server that supports GET on a location is required to support
+        // HEAD there too (RFC 7231 SS4.3.2) — it isn't a separate config
+        // knob, so a bare "GET" implicitly covers it.
+        let method_allowed = location
             .methods
             .iter()
             .any(|allowed| allowed == request.method.as_str())
-        {
+            || (request.method == Method::Head
+                && location.methods.iter().any(|allowed| allowed == "GET"));
+        if !method_allowed {
             return RouteResult::Response(
                 Response::error(405, "Method Not Allowed")
                     .header("Allow", &location.methods.join(", ")),
@@ -345,6 +350,7 @@ impl Connection {
 
         let response = match request.method {
             Method::Get => static_files::serve(location, &request.path),
+            Method::Head => static_files::serve(location, &request.path).without_body(),
             Method::Post => file_ops::create(location, request),
             Method::Delete => file_ops::delete(location, &request.path),
             _ => Response::error(501, "Not Implemented"),
@@ -583,6 +589,32 @@ mod tests {
         let text = String::from_utf8(response).unwrap();
         assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(text.ends_with("hello"));
+
+        unsafe { libc::close(epoll_fd) };
+    }
+
+    #[test]
+    fn head_request_gets_get_headers_with_no_body() {
+        let root = temp_site();
+        let groups = groups_with_one_static_site(&root);
+        let epoll_fd = test_epoll_fd();
+        let (mut conn, mut client) = accept_pair(epoll_fd);
+
+        client
+            .write_all(b"HEAD / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        let (response, closed) = drive_until_response(&mut conn, &mut client, &groups);
+        assert!(closed, "Connection: close should end with Outcome::Close");
+        drop(conn);
+
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(text.contains("Content-Length: 5\r\n"), "{text}"); // "hello".len()
+        assert!(
+            text.ends_with("\r\n\r\n"),
+            "HEAD response must not include a body: {text}"
+        );
 
         unsafe { libc::close(epoll_fd) };
     }

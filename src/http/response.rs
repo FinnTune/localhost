@@ -31,6 +31,18 @@ impl Response {
             .body(format!("{}\n", message).into_bytes())
     }
 
+    /// Strips the body while preserving the `Content-Length` it would have
+    /// had — what HEAD requires (RFC 7231 SS4.3.2: identical response
+    /// headers to GET, no body).
+    pub fn without_body(mut self) -> Self {
+        if !self.has_header("content-length") {
+            self.headers
+                .push(("Content-Length".to_string(), self.body.len().to_string()));
+        }
+        self.body.clear();
+        self
+    }
+
     pub fn status(&self) -> u16 {
         self.status
     }

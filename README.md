@@ -18,7 +18,12 @@ Implemented so far:
 - Location-based routing (longest-prefix match, nginx-style) and static file
   serving, with path canonicalization to block directory traversal
 - GET/POST/DELETE with per-location method enforcement (`405` + `Allow`),
-  POST writing uploaded bodies to disk, DELETE removing files
+  POST writing uploaded bodies to disk, DELETE removing files; HEAD is
+  implicitly allowed wherever GET is (per RFC 7231) and returns the same
+  headers with no body
+- Rejects requests with both `Content-Length` and `Transfer-Encoding`
+  headers (`400`) — ambiguous framing that's the classic request-smuggling
+  vector (RFC 7230 SS3.3.3), rather than silently picking one
 - Persistent (keep-alive) connections honoring `Connection: close` and the
   HTTP/1.0-vs-1.1 default, plus an idle-read timeout so an abandoned
   connection doesn't hang around forever
