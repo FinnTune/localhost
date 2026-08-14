@@ -134,9 +134,16 @@ oversized request bodies with `413` before any handler runs.
 cargo test
 cargo clippy -- -D warnings
 cargo fmt --all -- --check
+scripts/smoke.sh
 ```
 
-CI (`.github/workflows/rust.yml`) runs all three on every push and PR;
+`cargo test` exercises modules directly; `scripts/smoke.sh` is the
+complement — it boots the real binary and drives it over real sockets with
+curl (static files, 404, method-not-allowed, CGI, a full upload/GET/DELETE
+round trip, malformed input), catching integration-level regressions unit
+tests can't see. Takes a few seconds.
+
+CI (`.github/workflows/rust.yml`) runs all four on every push and PR;
 `.github/dependabot.yml` keeps `libc` and the workflow's pinned actions
 current.
 
