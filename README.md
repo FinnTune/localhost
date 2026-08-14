@@ -41,6 +41,9 @@ Implemented so far:
 - Fully event-driven connection handling: client sockets and CGI pipe fds
   all share one `epoll` instance (see Architecture below), so a slow or
   idle client can no longer block any other client
+- Access logging in Combined Log Format (the format nginx/Apache use) to
+  stdout, one line per response — including CGI and error responses,
+  timestamped via `libc::strftime` rather than a `time`/`chrono` crate
 
 All nine planned phases are done.
 

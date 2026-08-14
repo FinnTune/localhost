@@ -31,6 +31,14 @@ impl Response {
             .body(format!("{}\n", message).into_bytes())
     }
 
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
+    pub fn body_len(&self) -> usize {
+        self.body.len()
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = format!("HTTP/1.1 {} {}\r\n", self.status, self.reason).into_bytes();
         for (name, value) in &self.headers {

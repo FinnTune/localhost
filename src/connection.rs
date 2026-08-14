@@ -44,7 +44,45 @@ enum ConnState {
     RunningCgi {
         cgi: CgiProcess,
         keep_alive: bool,
+        meta: RequestMeta,
     },
+}
+
+/// The slice of a `Request` the access log needs, captured at dispatch time
+/// so it's still around once a CGI response resolves — by then the original
+/// `Request` (and its borrowed header strings) is long gone.
+#[derive(Clone)]
+struct RequestMeta {
+    method: String,
+    path: String,
+    version: String,
+    referer: Option<String>,
+    user_agent: Option<String>,
+}
+
+impl RequestMeta {
+    fn capture(request: &Request) -> Self {
+        RequestMeta {
+            method: request.method.as_str().to_string(),
+            path: request.path.clone(),
+            version: request.version.clone(),
+            referer: request.header("referer").map(str::to_string),
+            user_agent: request.header("user-agent").map(str::to_string),
+        }
+    }
+
+    fn log(&self, peer: &SocketAddr, response: &Response) {
+        crate::log::access(
+            peer,
+            &self.method,
+            &self.path,
+            &self.version,
+            self.referer.as_deref(),
+            self.user_agent.as_deref(),
+            response.status(),
+            response.body_len(),
+        );
+    }
 }
 
 enum RouteResult {
@@ -151,6 +189,16 @@ impl Connection {
                     ParseOutcome::Incomplete => return Outcome::Continue,
                     ParseOutcome::Invalid { status, message } => {
                         let response = Response::error(status, &message);
+                        crate::log::access(
+                            &self.peer_addr,
+                            "-",
+                            "-",
+                            "-",
+                            None,
+                            None,
+                            response.status(),
+                            response.body_len(),
+                        );
                         self.read_buf.clear();
                         self.enter_writing(response, false);
                     }
@@ -159,9 +207,11 @@ impl Connection {
                         let keep_alive = request.keep_alive();
                         match self.route(&request, groups) {
                             RouteResult::Response(response) => {
+                                RequestMeta::capture(&request).log(&self.peer_addr, &response);
                                 self.enter_writing(response, keep_alive);
                             }
                             RouteResult::Cgi(process) => {
+                                let meta = RequestMeta::capture(&request);
                                 let stdout_fd = process.stdout_fd();
                                 let stdin_fd = process.stdin_fd();
                                 self.epoll_add(stdout_fd, libc::EPOLLIN as u32);
@@ -171,6 +221,7 @@ impl Connection {
                                 self.state = ConnState::RunningCgi {
                                     cgi: process,
                                     keep_alive,
+                                    meta,
                                 };
                                 return Outcome::RegisterCgi {
                                     stdout_fd,
@@ -300,16 +351,19 @@ impl Connection {
         let ConnState::RunningCgi {
             cgi: process,
             keep_alive,
+            meta,
         } = &mut self.state
         else {
             return Outcome::Continue; // stale event after the process already finished
         };
         let keep_alive = *keep_alive;
+        let meta = meta.clone();
 
         let pid = process.pid();
         let result = cgi::advance(process, fd, readable, writable);
 
         if let Some(response) = result.done {
+            meta.log(&self.peer_addr, &response);
             self.enter_writing(response, keep_alive);
             return Outcome::CgiFinished {
                 closed_fds: result.closed_fds,
@@ -338,18 +392,22 @@ impl Connection {
         let ConnState::RunningCgi {
             cgi: process,
             keep_alive,
+            meta,
         } = &mut self.state
         else {
             return (Vec::new(), 0);
         };
         let keep_alive = *keep_alive;
+        let meta = meta.clone();
         let pid = process.pid();
         let fds: Vec<RawFd> = std::iter::once(process.stdout_fd())
             .chain(process.stdin_fd())
             .collect();
         cgi::kill(process);
         cgi::close_pipes(process);
-        self.enter_writing(Response::error(504, "CGI script timed out"), keep_alive);
+        let response = Response::error(504, "CGI script timed out");
+        meta.log(&self.peer_addr, &response);
+        self.enter_writing(response, keep_alive);
         (fds, pid)
     }
 
