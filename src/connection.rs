@@ -1,5 +1,5 @@
 use crate::cgi::{self, CgiProcess};
-use crate::config::ServerConfig;
+use crate::config::{Location, ServerConfig};
 use crate::http::{self, Method, ParseOutcome, Request, Response};
 use crate::{file_ops, router, static_files};
 use std::io::{self, Read, Write};
@@ -88,6 +88,20 @@ impl RequestMeta {
 enum RouteResult {
     Response(Response),
     Cgi(CgiProcess),
+}
+
+/// Methods this location actually accepts, including the implicit HEAD
+/// that comes bundled with GET — shared by the `Allow` header on both a
+/// 405 rejection and an OPTIONS response, so the two can't disagree.
+fn allow_header_value(location: &Location) -> String {
+    let mut methods: Vec<&str> = location.methods.iter().map(String::as_str).collect();
+    if methods.contains(&"GET") && !methods.contains(&"HEAD") {
+        methods.push("HEAD");
+    }
+    if !methods.contains(&"OPTIONS") {
+        methods.push("OPTIONS");
+    }
+    methods.join(", ")
 }
 
 pub struct Connection {
@@ -318,6 +332,15 @@ impl Connection {
             }
         };
 
+        // OPTIONS is a discovery method (RFC 7231 SS4.3.7): a client uses it
+        // to ask what's allowed here, so it must work even on a location
+        // whose configured `methods` doesn't list OPTIONS itself.
+        if request.method == Method::Options {
+            return RouteResult::Response(
+                Response::new(204, "No Content").header("Allow", &allow_header_value(location)),
+            );
+        }
+
         // A server that supports GET on a location is required to support
         // HEAD there too (RFC 7231 SS4.3.2) — it isn't a separate config
         // knob, so a bare "GET" implicitly covers it.
@@ -330,7 +353,7 @@ impl Connection {
         if !method_allowed {
             return RouteResult::Response(
                 Response::error(405, "Method Not Allowed")
-                    .header("Allow", &location.methods.join(", ")),
+                    .header("Allow", &allow_header_value(location)),
             );
         }
 
@@ -614,6 +637,32 @@ mod tests {
         assert!(
             text.ends_with("\r\n\r\n"),
             "HEAD response must not include a body: {text}"
+        );
+
+        unsafe { libc::close(epoll_fd) };
+    }
+
+    #[test]
+    fn options_request_lists_allowed_methods_with_no_body() {
+        let root = temp_site();
+        let groups = groups_with_one_static_site(&root);
+        let epoll_fd = test_epoll_fd();
+        let (mut conn, mut client) = accept_pair(epoll_fd);
+
+        client
+            .write_all(b"OPTIONS / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n")
+            .unwrap();
+
+        let (response, closed) = drive_until_response(&mut conn, &mut client, &groups);
+        assert!(closed, "Connection: close should end with Outcome::Close");
+        drop(conn);
+
+        let text = String::from_utf8(response).unwrap();
+        assert!(text.starts_with("HTTP/1.1 204 No Content\r\n"));
+        assert!(text.contains("Allow: GET, HEAD, OPTIONS\r\n"), "{text}");
+        assert!(
+            text.ends_with("\r\n\r\n"),
+            "OPTIONS response must not include a body: {text}"
         );
 
         unsafe { libc::close(epoll_fd) };

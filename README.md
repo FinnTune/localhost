@@ -24,7 +24,8 @@ Implemented so far:
 - GET/POST/DELETE with per-location method enforcement (`405` + `Allow`),
   POST writing uploaded bodies to disk, DELETE removing files; HEAD is
   implicitly allowed wherever GET is (per RFC 7231) and returns the same
-  headers with no body
+  headers with no body; OPTIONS works on every location regardless of its
+  configured `methods` and reports the real `Allow` set (`204`, no body)
 - Rejects requests with both `Content-Length` and `Transfer-Encoding`
   headers, or multiple `Content-Length` headers with differing values
   (`400` either way) — the two classic request-smuggling shapes (RFC 7230
