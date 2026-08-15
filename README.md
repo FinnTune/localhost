@@ -12,7 +12,11 @@ implemented directly in this repo rather than pulled in from `serde`,
 
 Implemented so far:
 - Non-blocking TCP listeners multiplexed on one `epoll` instance
-- A hand-rolled JSON parser/value type for reading `config/config.json`
+- A hand-rolled JSON parser/value type for reading `config/config.json`,
+  validated at startup: unknown HTTP methods, missing/non-directory
+  `root`s, malformed addresses, and duplicate server blocks that would
+  otherwise be silently unreachable all fail fast with a specific error
+  instead of a panic or confusing runtime behavior
 - An incremental HTTP/1.1 request parser (tolerates partial reads,
   `Content-Length` and chunked bodies) and a response builder
 - Location-based routing (longest-prefix match, nginx-style) and static file

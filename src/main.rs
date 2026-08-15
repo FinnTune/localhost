@@ -171,7 +171,13 @@ fn sweep_timeouts(
 }
 
 fn main() -> std::io::Result<()> {
-    let config = load_config("config/config.json").expect("Failed to load config");
+    let config = match load_config("config/config.json") {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Invalid configuration: {}", e);
+            std::process::exit(1);
+        }
+    };
 
     let epoll_fd = unsafe { epoll_create1(0) };
     if epoll_fd == -1 {
