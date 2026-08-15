@@ -22,8 +22,9 @@ Implemented so far:
   implicitly allowed wherever GET is (per RFC 7231) and returns the same
   headers with no body
 - Rejects requests with both `Content-Length` and `Transfer-Encoding`
-  headers (`400`) — ambiguous framing that's the classic request-smuggling
-  vector (RFC 7230 SS3.3.3), rather than silently picking one
+  headers, or multiple `Content-Length` headers with differing values
+  (`400` either way) — the two classic request-smuggling shapes (RFC 7230
+  SS3.3.3), rather than silently picking one
 - Persistent (keep-alive) connections honoring `Connection: close` and the
   HTTP/1.0-vs-1.1 default, plus an idle-read timeout so an abandoned
   connection doesn't hang around forever

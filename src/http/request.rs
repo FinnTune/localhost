@@ -160,7 +160,29 @@ pub fn parse(buffer: &[u8]) -> ParseOutcome {
                 }
             }
         };
-        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim().to_string();
+
+        // RFC 7230 SS3.3.3 rule 4: repeated Content-Length headers with
+        // differing values is the other classic smuggling shape (CL.CL
+        // desync) — whichever one each intermediary picks determines where
+        // it thinks the body ends. Identical repeats are spec-legal (the
+        // rule permits normalizing them to one field) and just overwrite
+        // below as before.
+        if name == "content-length" {
+            if let Some(existing) = headers.get(&name) {
+                if existing != &value {
+                    return ParseOutcome::Invalid {
+                        status: 400,
+                        message:
+                            "Request has multiple Content-Length headers with differing values"
+                                .to_string(),
+                    };
+                }
+            }
+        }
+
+        headers.insert(name, value);
     }
 
     // RFC 7230 SS3.3.3 rule 3: a request with both headers has ambiguous
@@ -381,6 +403,22 @@ mod tests {
             ParseOutcome::Invalid { status, .. } => assert_eq!(status, 400),
             other => panic!("expected Invalid(400), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rejects_conflicting_duplicate_content_length() {
+        let raw = b"POST /submit HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 10\r\n\r\nhello";
+        match parse(raw) {
+            ParseOutcome::Invalid { status, .. } => assert_eq!(status, 400),
+            other => panic!("expected Invalid(400), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_identical_duplicate_content_length() {
+        let raw = b"POST /submit HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let (request, _) = expect_complete(raw);
+        assert_eq!(request.body, b"hello");
     }
 
     #[test]
