@@ -91,6 +91,46 @@ resolves. That's outside the scope of the C10K problem this design solves —
 it targets slow/idle *network peers* and *CGI subprocesses*, not local
 filesystem latency, which is negligible on any reasonable disk.
 
+Every fd on the one `epoll` instance is dispatched by role (`src/main.rs`),
+and every event outcome funnels back through the same small set of state
+transitions:
+
+```mermaid
+flowchart TD
+    W["epoll_wait (bounded by SWEEP_INTERVAL_MS)"] --> R{fd_roles lookup}
+    R -->|"Listener(group_id)"| ACC["accept() -> Connection::accept()"]
+    R -->|Client| CONN["Connection::on_readable / on_writable"]
+    R -->|"CgiPipe(owner_fd)"| CGI["Connection::on_cgi_event"]
+
+    ACC --> INS[("connections.insert")]
+    CONN --> OUT{Outcome}
+    CGI --> OUT
+
+    OUT -->|Continue| INS
+    OUT -->|RegisterCgi| REG["epoll_ctl ADD stdout/stdin pipe fds"]
+    OUT -->|UnregisterCgiFds| UNREG["drop pipe fds from fd_roles"]
+    OUT -->|CgiFinished| REAP["queue pid in pending_reaps"]
+    OUT -->|Close| CLOSE["close_connection: abandon CGI, drop fds, close socket"]
+
+    W --> SWEEP["sweep_timeouts: idle clients + CGI deadlines"]
+    W --> WAITPID["reap_pending: non-blocking waitpid(WNOHANG)"]
+```
+
+And the state machine `src/connection.rs` drives per connection:
+
+```mermaid
+stateDiagram-v2
+    [*] --> ReadingRequest: on accept
+    ReadingRequest --> ReadingRequest: partial request, wait for more bytes
+    ReadingRequest --> Writing: static or error response ready
+    ReadingRequest --> RunningCgi: request maps to a CGI script
+    RunningCgi --> Writing: script exits, or 5s deadline hit (504)
+    Writing --> ReadingRequest: response sent, keep-alive
+    Writing --> [*]: response sent, connection close
+    ReadingRequest --> [*]: idle timeout, EOF, or malformed input
+    RunningCgi --> [*]: client disconnects mid-CGI
+```
+
 ## Running
 
 ```sh
